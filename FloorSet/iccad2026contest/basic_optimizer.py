@@ -3,13 +3,14 @@
 ICCAD 2026 FloorSet Challenge - Optimizer Template
 
 USAGE:
-  1. Copy: cp optimizer_template.py my_optimizer.py
+  1. Copy: cp basic_optimizer.py my_optimizer.py
   2. Replace the B*-tree code with your algorithm
   3. Test: python iccad2026_evaluate.py --evaluate my_optimizer.py
 
 BASELINE: B*-tree Simulated Annealing
   - GUARANTEES: Overlap-free, area constraints satisfied
-  - NOT HANDLED: Fixed, preplaced, MIB, cluster, boundary constraints
+  - HANDLED: Fixed-shape dimensions and preplaced location/dimensions
+  - NOT HANDLED: MIB, cluster, boundary constraints
 
 Your solve() receives:
   - block_count: int
@@ -30,6 +31,8 @@ Your solve() must return:
 HARD CONSTRAINTS (violation = Cost 10.0):
   - NO OVERLAPS between blocks
   - AREA: w*h within 1% of area_targets[i]
+  - FIXED-SHAPE: exact specified width/height
+  - PREPLACED: exact specified x/y/width/height
 
 RELAXED CONSTRAINTS:
   - Aspect ratio: Any w/h ratio is valid
@@ -352,12 +355,13 @@ class MyOptimizer(FloorplanOptimizer):
         REPLACE THIS METHOD with your algorithm.
         Must return List[(x, y, w, h)] with exactly block_count entries.
         """
+        locked_dims, preplaced = self._constraint_masks(block_count, target_positions)
+
         # Initialize dimensions: use target dimensions for fixed/preplaced
         # blocks, otherwise start with a square matching the area target.
         widths, heights = [], []
         for i in range(block_count):
-            if (target_positions is not None and
-                    target_positions[i, 2] != -1 and target_positions[i, 3] != -1):
+            if locked_dims[i]:
                 w = float(target_positions[i, 2])
                 h = float(target_positions[i, 3])
             else:
@@ -365,6 +369,15 @@ class MyOptimizer(FloorplanOptimizer):
                 w = h = math.sqrt(area)
             widths.append(w)
             heights.append(h)
+
+        # Preplaced blocks have immutable coordinates. The B*-tree packer does
+        # not support fixed obstacles, so keep the baseline feasible by packing
+        # movable blocks separately and placing them above all preplaced blocks.
+        if any(preplaced):
+            return self._solve_with_preplaced(
+                block_count, widths, heights, locked_dims, preplaced, target_positions,
+                b2b_connectivity, p2b_connectivity, pins_pos
+            )
         
         # Build B*-tree
         tree = BStarTree(block_count, widths, heights)
@@ -385,7 +398,11 @@ class MyOptimizer(FloorplanOptimizer):
                 move = random.randint(0, 1)
                 if move == 0:
                     # Rotate: swap w/h (preserves area w*h)
-                    tree.move_rotate(random.randint(0, block_count - 1))
+                    rotatable = [i for i in range(block_count) if not locked_dims[i]]
+                    if rotatable:
+                        tree.move_rotate(random.choice(rotatable))
+                    else:
+                        tree.move_delete_insert(random.randint(0, block_count - 1))
                 else:
                     # Delete-insert: move block to new tree position (preserves area)
                     tree.move_delete_insert(random.randint(0, block_count - 1))
@@ -408,6 +425,130 @@ class MyOptimizer(FloorplanOptimizer):
             temp *= self.cooling_rate
         
         return best_positions
+
+    def _constraint_masks(
+        self,
+        block_count: int,
+        target_positions: torch.Tensor = None
+    ) -> Tuple[List[bool], List[bool]]:
+        """Infer immutable dimensions and preplaced blocks from target_positions."""
+        locked_dims = [False] * block_count
+        preplaced = [False] * block_count
+
+        if target_positions is None:
+            return locked_dims, preplaced
+
+        for i in range(block_count):
+            has_dims = target_positions[i, 2] != -1 and target_positions[i, 3] != -1
+            has_xy = target_positions[i, 0] != -1 and target_positions[i, 1] != -1
+            locked_dims[i] = bool(has_dims)
+            preplaced[i] = bool(has_dims and has_xy)
+
+        return locked_dims, preplaced
+
+    def _solve_with_preplaced(
+        self,
+        block_count: int,
+        widths: List[float],
+        heights: List[float],
+        locked_dims: List[bool],
+        preplaced: List[bool],
+        target_positions: torch.Tensor,
+        b2b_connectivity: torch.Tensor,
+        p2b_connectivity: torch.Tensor,
+        pins_pos: torch.Tensor,
+    ) -> List[Tuple[float, float, float, float]]:
+        """Place preplaced blocks exactly and optimize movable blocks above them."""
+        positions = [None] * block_count
+        preplaced_top = 0.0
+        preplaced_left = 0.0
+
+        for i in range(block_count):
+            if not preplaced[i]:
+                continue
+            x = float(target_positions[i, 0])
+            y = float(target_positions[i, 1])
+            w = float(target_positions[i, 2])
+            h = float(target_positions[i, 3])
+            positions[i] = (x, y, w, h)
+            preplaced_top = max(preplaced_top, y + h)
+            preplaced_left = min(preplaced_left, x)
+
+        movable = [i for i in range(block_count) if not preplaced[i]]
+        if not movable:
+            return positions
+
+        movable_tree = BStarTree(
+            len(movable),
+            [widths[i] for i in movable],
+            [heights[i] for i in movable],
+        )
+        current_positions = movable_tree.pack()
+        current_cost = self._cost_with_preplaced(
+            current_positions, movable, positions, preplaced_left, preplaced_top,
+            b2b_connectivity, p2b_connectivity, pins_pos
+        )
+        best_positions = current_positions
+        best_cost = current_cost
+
+        temp = self.initial_temp
+        while temp > self.final_temp:
+            for _ in range(self.moves_per_temp):
+                old_tree = movable_tree.copy()
+
+                move = random.randint(0, 1)
+                if move == 0:
+                    rotatable = [
+                        local_i for local_i, global_i in enumerate(movable)
+                        if not locked_dims[global_i]
+                    ]
+                    if rotatable:
+                        movable_tree.move_rotate(random.choice(rotatable))
+                    else:
+                        movable_tree.move_delete_insert(random.randint(0, len(movable) - 1))
+                else:
+                    movable_tree.move_delete_insert(random.randint(0, len(movable) - 1))
+
+                new_positions = movable_tree.pack()
+                new_cost = self._cost_with_preplaced(
+                    new_positions, movable, positions, preplaced_left, preplaced_top,
+                    b2b_connectivity, p2b_connectivity, pins_pos
+                )
+
+                delta = new_cost - current_cost
+                if delta < 0 or random.random() < math.exp(-delta / temp):
+                    current_positions = new_positions
+                    current_cost = new_cost
+                    if current_cost < best_cost:
+                        best_cost = current_cost
+                        best_positions = new_positions
+                else:
+                    movable_tree = old_tree
+
+            temp *= self.cooling_rate
+
+        for local_i, global_i in enumerate(movable):
+            x, y, w, h = best_positions[local_i]
+            positions[global_i] = (x + preplaced_left, y + preplaced_top, w, h)
+
+        return positions
+
+    def _cost_with_preplaced(
+        self,
+        movable_positions,
+        movable_indices,
+        preplaced_positions,
+        x_offset,
+        y_offset,
+        b2b_conn,
+        p2b_conn,
+        pins_pos,
+    ) -> float:
+        positions = list(preplaced_positions)
+        for local_i, global_i in enumerate(movable_indices):
+            x, y, w, h = movable_positions[local_i]
+            positions[global_i] = (x + x_offset, y + y_offset, w, h)
+        return self._cost(positions, b2b_conn, p2b_conn, pins_pos)
     
     def _cost(self, positions, b2b_conn, p2b_conn, pins_pos) -> float:
         """Evaluate solution quality (lower is better)."""
