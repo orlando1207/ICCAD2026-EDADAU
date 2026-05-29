@@ -62,7 +62,7 @@ class MyOptimizer(FloorplanOptimizer):
         # with the smallest bounding-box area (proxy for area_gap).
         # Seed 0 = no noise (deterministic baseline); seeds 1+ add perturbation.
         # ------------------------------------------------------------------
-        N_STARTS  = 4
+        N_STARTS  = 1
         NOISE_STD = 0.12   # fraction of chip_side added as Gaussian noise
 
         best_positions = None
