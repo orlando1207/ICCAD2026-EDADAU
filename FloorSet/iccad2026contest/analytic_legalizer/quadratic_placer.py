@@ -240,41 +240,32 @@ def _spread_nodes(
     """
     n = len(cx)
     step = 0.5
+    cx = np.asarray(cx, dtype=np.float64).copy()
+    cy = np.asarray(cy, dtype=np.float64).copy()
+    W = np.asarray(widths, dtype=np.float64)
+    H = np.asarray(heights, dtype=np.float64)
+    free = np.array([k not in fixed_x for k in range(n)])
+    halfW = (W[:, None] + W[None, :]) / 2.0   # pairwise half-sum of widths
+    halfH = (H[:, None] + H[None, :]) / 2.0
 
     for it in range(n_iters):
-        fx = np.zeros(n)
-        fy = np.zeros(n)
+        # Vectorized pairwise repulsion (equivalent to the O(n²) loop above).
+        DX = cx[:, None] - cx[None, :]
+        DY = cy[:, None] - cy[None, :]
+        OX = halfW - np.abs(DX)
+        OY = halfH - np.abs(DY)
+        mask = (OX > 0) & (OY > 0)
+        np.fill_diagonal(mask, False)
+        overlap = np.minimum(OX, OY)
+        dist = np.sqrt(DX * DX + DY * DY) + 1e-9
+        coef = np.where(mask, overlap / dist, 0.0)
+        fx = (coef * DX).sum(axis=1)
+        fy = (coef * DY).sum(axis=1)
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                # Distance between centers
-                dx = cx[i] - cx[j]
-                dy = cy[i] - cy[j]
-
-                # Overlap in each axis
-                ox = (widths[i] + widths[j]) / 2.0 - abs(dx)
-                oy = (heights[i] + heights[j]) / 2.0 - abs(dy)
-
-                if ox <= 0 or oy <= 0:
-                    continue  # no overlap
-
-                # Push along the smaller-overlap axis
-                overlap = min(ox, oy)
-                dist = math.sqrt(dx * dx + dy * dy) + 1e-9
-                fx[i] += overlap * dx / dist
-                fy[i] += overlap * dy / dist
-                fx[j] -= overlap * dx / dist
-                fy[j] -= overlap * dy / dist
-
-        # Apply forces, keep fixed nodes still
-        for k in range(n):
-            if k in fixed_x:
-                continue
-            cx[k] += step * fx[k]
-            cy[k] += step * fy[k]
-            # Clamp inside chip
-            cx[k] = max(widths[k]  / 2.0, min(chip_side - widths[k]  / 2.0, cx[k]))
-            cy[k] = max(heights[k] / 2.0, min(chip_side - heights[k] / 2.0, cy[k]))
+        new_cx = np.clip(cx + step * fx, W / 2.0, chip_side - W / 2.0)
+        new_cy = np.clip(cy + step * fy, H / 2.0, chip_side - H / 2.0)
+        cx = np.where(free, new_cx, cx)   # fixed nodes never move
+        cy = np.where(free, new_cy, cy)
 
         step *= 0.95  # cool the step size
 

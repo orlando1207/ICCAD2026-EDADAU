@@ -87,6 +87,9 @@ class MyOptimizer(FloorplanOptimizer):
             _pos = slide_boundary(_pos, blocks, super_blocks, cluster_groups)
             _pos = enforce_hard(_pos, blocks, area_targets)
 
+            if N_STARTS == 1:
+                return _pos  # single candidate — skip the (expensive) selection proxy
+
             _x2 = max(p[0] + p[2] for p in _pos)
             _y2 = max(p[1] + p[3] for p in _pos)
             _hpwl = (calculate_hpwl_b2b(_pos, b2b_connectivity)

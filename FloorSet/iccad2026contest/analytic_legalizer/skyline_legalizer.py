@@ -347,17 +347,21 @@ def _finetune_fill_gaps(positions, blocks, cluster_groups):
     if not clbb:
         return pos
 
+    # Vectorized occupancy arrays (rebuilt each pass; pos only changes on a move,
+    # which breaks the pass).
+    X = np.array([p[0] for p in pos]); Y = np.array([p[1] for p in pos])
+    XE = np.array([p[0] + p[2] for p in pos]); YE = np.array([p[1] + p[3] for p in pos])
+
     def overlaps_any(rx, ry, rw, rh, exclude):
-        for j in range(n):
-            if j == exclude:
-                continue
-            jx, jy, jw, jh = pos[j]
-            if (min(rx + rw, jx + jw) - max(rx, jx) > 1e-6 and
-                    min(ry + rh, jy + jh) - max(ry, jy) > 1e-6):
-                return True
-        return False
+        ox = np.minimum(rx + rw, XE) - np.maximum(rx, X)
+        oy = np.minimum(ry + rh, YE) - np.maximum(ry, Y)
+        hit = (ox > 1e-6) & (oy > 1e-6)
+        hit[exclude] = False
+        return bool(hit.any())
 
     for _ in range(6):
+        X[:] = [p[0] for p in pos]; Y[:] = [p[1] for p in pos]
+        XE[:] = [p[0] + p[2] for p in pos]; YE[:] = [p[1] + p[3] for p in pos]
         x2 = max(p[0] + p[2] for p in pos)
         y2 = max(p[1] + p[3] for p in pos)
         area0 = x2 * y2
