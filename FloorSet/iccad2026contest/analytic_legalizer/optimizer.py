@@ -12,7 +12,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from iccad2026_evaluate import FloorplanOptimizer
+from iccad2026_evaluate import (
+    FloorplanOptimizer, calculate_hpwl_b2b, calculate_hpwl_p2b,
+)
 
 from .constraints import (
     parse_and_init, prepack_clusters,
@@ -57,49 +59,41 @@ class MyOptimizer(FloorplanOptimizer):
         super_blocks = prepack_clusters(blocks, cluster_groups)
 
         # ------------------------------------------------------------------
-        # Steps 3–6c: analytic place → topology → pack → shape → compact.
-        # Run N_STARTS times with different spreading seeds; keep the layout
-        # with the smallest bounding-box area (proxy for area_gap).
-        # Seed 0 = no noise (deterministic baseline); seeds 1+ add perturbation.
+        # Steps 3–8: analytic place → skyline legalize → slide → enforce, run
+        # N_STARTS times with different analytic seeds. Select the start with the
+        # smallest area·HPWL proxy: HPWL is now the dominant cost term, so the old
+        # min-area / area·e^(2·boundary) selectors actually picked worse layouts.
+        # An area·HPWL selector matches the oracle (best actual cost) on the
+        # dominant cases. HPWL is computed from connectivity (no baseline needed).
+        # Seed 0 = no noise (deterministic); seeds 1+ add perturbation.
         # ------------------------------------------------------------------
-        N_STARTS  = 1
+        N_STARTS  = 4
         NOISE_STD = 0.12   # fraction of chip_side added as Gaussian noise
 
         best_positions = None
-        best_bbox_area = float('inf')
+        best_proxy = float('inf')
 
         for _start in range(N_STARTS):
             seed = _start  # seed 0 → no noise (baseline)
 
-            # Step 3: analytic global placement
             _cx, _cy = analytic_place(
                 blocks, super_blocks, cluster_groups,
                 b2b_connectivity, p2b_connectivity, pins_pos,
                 seed=seed, noise_std=(NOISE_STD if seed > 0 else 0.0),
             )
-
-            # Steps 4–6: skyline strip-packing legalization (replaces topology /
-            # longest-path / shaping / compact). Returns a cost-proxy score used
-            # to select across analytic seeds.
-            _pos, _score = skyline_legalize(
+            _pos, _ = skyline_legalize(
                 blocks, super_blocks, cluster_groups, _cx, _cy, area_targets,
             )
-            if _score < best_bbox_area:
-                best_bbox_area = _score
+            _pos = slide_boundary(_pos, blocks, super_blocks, cluster_groups)
+            _pos = enforce_hard(_pos, blocks, area_targets)
+
+            _x2 = max(p[0] + p[2] for p in _pos)
+            _y2 = max(p[1] + p[3] for p in _pos)
+            _hpwl = (calculate_hpwl_b2b(_pos, b2b_connectivity)
+                     + calculate_hpwl_p2b(_pos, p2b_connectivity, pins_pos))
+            _proxy = (_x2 * _y2) * (_hpwl if _hpwl > 1e-9 else 1.0)
+            if _proxy < best_proxy:
+                best_proxy = _proxy
                 best_positions = _pos
 
-        positions = best_positions
-
-        # ------------------------------------------------------------------
-        # Step 7: boundary slide (RIGHT/TOP blocks to bbox edge)
-        # ------------------------------------------------------------------
-        positions = slide_boundary(
-            positions, blocks, super_blocks, cluster_groups
-        )
-
-        # ------------------------------------------------------------------
-        # Step 8: hard constraint enforcement (overlap, area, preplaced)
-        # ------------------------------------------------------------------
-        positions = enforce_hard(positions, blocks, area_targets)
-
-        return positions
+        return best_positions
