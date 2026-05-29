@@ -6,9 +6,9 @@ Core design:
   - Original block IDs are preserved through the whole flow.
   - Preplaced blocks are immutable obstacles and are excluded from B*-trees.
   - Soft-block dimensions are derived from area and aspect ratio.
-  - MIB soft groups share one aspect-ratio state and one average group area.
-  - Cluster/grouping constraints use hierarchical sub-B*-trees at high
-    temperature and are de-clustered into individual blocks at low temperature.
+  - MIB soft groups share one exact canonical shape state.
+  - Cluster/grouping constraints use persistent hierarchical sub-B*-trees
+    through the whole annealing process.
 """
 
 import math
@@ -82,6 +82,7 @@ class ShapeState:
         self.block_ar: Dict[int, float] = {}
         self.mib_ar: Dict[int, float] = {}
         self.mib_area: Dict[int, float] = {}
+        self.mib_dims: Dict[int, Tuple[float, float]] = {}
 
         mib_members: Dict[int, List[int]] = {}
         for block in blocks.values():
@@ -95,6 +96,7 @@ class ShapeState:
         for mib, members in mib_members.items():
             self.mib_ar[mib] = 1.0
             self.mib_area[mib] = sum(blocks[i].area for i in members) / max(1, len(members))
+        self._refresh_mib_dims()
 
     def copy(self) -> "ShapeState":
         new = ShapeState.__new__(ShapeState)
@@ -102,6 +104,7 @@ class ShapeState:
         new.block_ar = self.block_ar.copy()
         new.mib_ar = self.mib_ar.copy()
         new.mib_area = self.mib_area.copy()
+        new.mib_dims = self.mib_dims.copy()
         return new
 
     def _soft_area_ar(self, block_id: int) -> Tuple[float, float]:
@@ -114,6 +117,9 @@ class ShapeState:
         block = self.blocks[block_id]
         if block.is_fixed or block.is_preplaced:
             return block.target_w, block.target_h
+
+        if block.mib > 0 and block.mib in self.mib_dims:
+            return self.mib_dims[block.mib]
 
         area, ar = self._soft_area_ar(block_id)
         ar = min(AR_MAX, max(AR_MIN, ar))
@@ -128,6 +134,7 @@ class ShapeState:
         kind, idx = key
         if kind == "mib":
             self.mib_ar[idx] = self._clamp_ar(1.0 / max(self.mib_ar[idx], EPS))
+            self._refresh_mib_dim(idx)
         else:
             self.block_ar[idx] = self._clamp_ar(1.0 / max(self.block_ar[idx], EPS))
 
@@ -142,8 +149,30 @@ class ShapeState:
 
         if kind == "mib":
             self.mib_ar[idx] = self._clamp_ar(self.mib_ar[idx] * factor)
+            self._refresh_mib_dim(idx)
         else:
             self.block_ar[idx] = self._clamp_ar(self.block_ar[idx] * factor)
+
+    def set_random_ar(self, key: Tuple[str, int], lo: float = 0.25, hi: float = 4.0) -> None:
+        ar = self._clamp_ar(math.exp(random.uniform(math.log(lo), math.log(hi))))
+        kind, idx = key
+        if kind == "mib":
+            self.mib_ar[idx] = ar
+            self._refresh_mib_dim(idx)
+        else:
+            self.block_ar[idx] = ar
+
+    def _refresh_mib_dims(self) -> None:
+        for mib in self.mib_ar:
+            self._refresh_mib_dim(mib)
+
+    def _refresh_mib_dim(self, mib: int) -> None:
+        area = self.mib_area[mib]
+        ar = self._clamp_ar(self.mib_ar[mib])
+        self.mib_dims[mib] = (
+            math.sqrt(max(area, EPS) * ar),
+            math.sqrt(max(area, EPS) / ar),
+        )
 
     @staticmethod
     def _clamp_ar(ar: float) -> float:
@@ -503,8 +532,10 @@ class MyOptimizer(FloorplanOptimizer):
         self._configure_budget(len(movable))
         self._prepare_fast_nets(b2b_connectivity, p2b_connectivity)
         hints = self._build_init_hints(movable, blocks, b2b_connectivity, p2b_connectivity)
+        groups = self._build_group_macros(blocks, movable)
+        payloads = self._top_level_payloads(movable, groups)
         state = self._multi_start_initial_state(
-            movable, shape, hints, preplaced,
+            payloads, shape, groups, hints, preplaced,
             b2b_connectivity, p2b_connectivity, pins_pos, blocks,
         )
         state = self._anneal(
@@ -512,6 +543,9 @@ class MyOptimizer(FloorplanOptimizer):
             blocks, phase="low", temp_steps=self.sa_temp_steps,
         )
         best_positions = self._pack_state(state, preplaced, phase="low")
+        best_positions = self._legalize_boundary_blocks(
+            best_positions, b2b_connectivity, p2b_connectivity, pins_pos, blocks,
+        )
 
         if (
             not math.isfinite(self._cost(best_positions, b2b_connectivity, p2b_connectivity, pins_pos, blocks, "low"))
@@ -684,6 +718,7 @@ class MyOptimizer(FloorplanOptimizer):
         self,
         payloads: List[int],
         shape: ShapeState,
+        groups: Dict[int, GroupMacro],
         hints: InitHints,
         preplaced: Dict[int, Tuple[float, float, float, float]],
         b2b: torch.Tensor,
@@ -697,14 +732,15 @@ class MyOptimizer(FloorplanOptimizer):
 
         for seed_idx in range(seed_count):
             trial_shape = shape.copy()
-            if seed_idx > 0:
-                self._randomize_initial_shapes(trial_shape)
+            trial_groups = {gid: group.copy() for gid, group in groups.items()}
+            self._randomize_initial_shapes(trial_shape)
+            self._randomize_group_trees(trial_groups, hints, blocks)
             if seed_idx == 0:
-                order = self._connectivity_order(payloads, blocks, {}, b2b, p2b, pins)
+                order = self._connectivity_order(payloads, blocks, trial_groups, b2b, p2b, pins)
             else:
-                order = self._randomized_payload_order(payloads, hints, blocks)
-            tree = self._build_random_bstar_tree(order, hints, blocks)
-            state = SearchState(tree, trial_shape, {})
+                order = self._randomized_payload_order(payloads, hints, blocks, trial_groups)
+            tree = self._build_random_bstar_tree(order, hints, blocks, trial_groups)
+            state = SearchState(tree, trial_shape, trial_groups)
             positions = self._pack_state(state, preplaced, phase="low")
             cost = self._cost(positions, b2b, p2b, pins, blocks, "low")
             if cost < best_cost:
@@ -712,7 +748,11 @@ class MyOptimizer(FloorplanOptimizer):
                 best_cost = cost
 
         if best_state is None:
-            return SearchState(self._build_random_bstar_tree(payloads, hints, blocks), shape, {})
+            return SearchState(
+                self._build_random_bstar_tree(payloads, hints, blocks, groups),
+                shape,
+                {gid: group.copy() for gid, group in groups.items()},
+            )
         return best_state
 
     def _build_random_bstar_tree(
@@ -720,7 +760,9 @@ class MyOptimizer(FloorplanOptimizer):
         payloads: Sequence[int],
         hints: InitHints,
         blocks: Dict[int, BlockInfo],
+        groups: Optional[Dict[int, GroupMacro]] = None,
     ) -> BStarTree:
+        groups = groups or {}
         tree = BStarTree.__new__(BStarTree)
         tree.payloads = list(payloads)
         tree.n = len(tree.payloads)
@@ -732,26 +774,26 @@ class MyOptimizer(FloorplanOptimizer):
             return tree
 
         placed_nodes = [0]
-        payload_to_node = {tree.payloads[0]: 0}
         for node in range(1, tree.n):
-            bid = tree.payloads[node]
+            payload = tree.payloads[node]
             candidates: List[Tuple[int, float]] = []
-            block = blocks[bid]
             for target in placed_nodes:
-                parent_bid = tree.payloads[target]
-                parent_block = blocks[parent_bid]
+                parent_payload = tree.payloads[target]
                 weight = 1.0
-                weight += 1.35 * math.log1p(hints.adjacency.get(bid, {}).get(parent_bid, 0.0))
-                if block.cluster > 0 and block.cluster == parent_block.cluster:
-                    weight += 3.0
-                if block.mib > 0 and block.mib == parent_block.mib:
+                weight += 1.35 * math.log1p(
+                    self._payload_adjacency(payload, parent_payload, hints, groups)
+                )
+                if self._payloads_share_mib(payload, parent_payload, blocks, groups):
                     weight += 1.25
-                if bid in hints.boundary_blocks and parent_bid in hints.boundary_blocks:
+                if (
+                    self._payload_boundary(payload, blocks, groups)
+                    and self._payload_boundary(parent_payload, blocks, groups)
+                ):
                     weight += 0.75
                 candidates.append((target, weight))
 
             target = self._weighted_choice(candidates)
-            side = self._biased_insert_side(bid, blocks)
+            side = self._biased_insert_side(payload, blocks, groups)
             old_child = tree.left[target] if side == 0 else tree.right[target]
             if side == 0:
                 tree.left[target] = node
@@ -763,11 +805,15 @@ class MyOptimizer(FloorplanOptimizer):
                 tree.parent[old_child] = node
             tree.parent[node] = target
             placed_nodes.append(node)
-            payload_to_node[bid] = node
         return tree
 
-    def _biased_insert_side(self, bid: int, blocks: Dict[int, BlockInfo]) -> int:
-        code = blocks[bid].boundary
+    def _biased_insert_side(
+        self,
+        payload: int,
+        blocks: Dict[int, BlockInfo],
+        groups: Optional[Dict[int, GroupMacro]] = None,
+    ) -> int:
+        code = self._payload_boundary(payload, blocks, groups or {})
         if code == 0:
             return random.randint(0, 1)
         # This is only a weak topology bias. Actual boundary satisfaction is
@@ -784,53 +830,42 @@ class MyOptimizer(FloorplanOptimizer):
 
     def _randomize_initial_shapes(self, shape: ShapeState) -> None:
         for key in shape.soft_shape_keys():
-            kind, idx = key
-            # Mild log-uniform perturbation keeps area exact and avoids extreme
-            # skinny starts before SA has a chance to evaluate the layout.
-            factor = math.exp(random.uniform(math.log(0.65), math.log(1.55)))
-            if kind == "mib":
-                shape.mib_ar[idx] = shape._clamp_ar(shape.mib_ar[idx] * factor)
-            else:
-                shape.block_ar[idx] = shape._clamp_ar(shape.block_ar[idx] * factor)
+            shape.set_random_ar(key, 0.25, 4.0)
 
     def _randomized_payload_order(
         self,
         payloads: List[int],
         hints: InitHints,
         blocks: Dict[int, BlockInfo],
+        groups: Optional[Dict[int, GroupMacro]] = None,
     ) -> List[int]:
+        groups = groups or {}
         remaining = set(payloads)
         order: List[int] = []
-        placed_groups: Dict[int, int] = {}
         placed_mibs: Dict[int, int] = {}
 
         while remaining:
             weights: List[Tuple[int, float]] = []
             previous = order[-1] if order else None
-            for bid in remaining:
-                block = blocks[bid]
-                weight = 1.0 + 0.12 * math.sqrt(max(block.area, EPS))
-                weight += 0.65 * math.log1p(hints.degree.get(bid, 0.0))
-                if bid in hints.boundary_blocks:
+            for payload in remaining:
+                weight = 1.0 + 0.12 * math.sqrt(max(self._payload_area(payload, blocks, groups), EPS))
+                weight += 0.65 * math.log1p(self._payload_degree(payload, hints, groups))
+                if self._payload_boundary(payload, blocks, groups):
                     weight += 2.0 if not order else 0.55
                 if previous is not None:
-                    weight += 1.10 * math.log1p(hints.adjacency.get(previous, {}).get(bid, 0.0))
-                if block.cluster > 0 and block.cluster in placed_groups:
-                    weight += 1.65
-                if block.mib > 0 and block.mib in placed_mibs:
+                    weight += 1.10 * math.log1p(self._payload_adjacency(previous, payload, hints, groups))
+                mibs = self._payload_mibs(payload, blocks, groups)
+                if any(mib in placed_mibs for mib in mibs):
                     weight += 0.85
                 # Keep stochasticity high enough that preprocessing is a bias,
                 # not a deterministic shelf/order replacement.
-                weights.append((bid, max(0.05, weight)))
+                weights.append((payload, max(0.05, weight)))
 
             chosen = self._weighted_choice(weights)
             remaining.remove(chosen)
             order.append(chosen)
-            block = blocks[chosen]
-            if block.cluster > 0:
-                placed_groups[block.cluster] = placed_groups.get(block.cluster, 0) + 1
-            if block.mib > 0:
-                placed_mibs[block.mib] = placed_mibs.get(block.mib, 0) + 1
+            for mib in self._payload_mibs(chosen, blocks, groups):
+                placed_mibs[mib] = placed_mibs.get(mib, 0) + 1
         return order
 
     @staticmethod
@@ -860,6 +895,24 @@ class MyOptimizer(FloorplanOptimizer):
             tree = BStarTree(members, deterministic=True)
             groups[gid] = GroupMacro(gid, members, tree)
         return groups
+
+    def _top_level_payloads(self, movable: Iterable[int], groups: Dict[int, GroupMacro]) -> List[int]:
+        grouped = {bid for group in groups.values() for bid in group.members}
+        payloads = [-gid for gid in sorted(groups)]
+        payloads.extend(bid for bid in movable if bid not in grouped)
+        return payloads
+
+    def _randomize_group_trees(
+        self,
+        groups: Dict[int, GroupMacro],
+        hints: InitHints,
+        blocks: Dict[int, BlockInfo],
+    ) -> None:
+        for group in groups.values():
+            if len(group.members) < 2:
+                continue
+            order = self._randomized_payload_order(group.members, hints, blocks, {})
+            group.tree = self._build_random_bstar_tree(order, hints, blocks, {})
 
     def _ordered_payloads(
         self,
@@ -1070,6 +1123,49 @@ class MyOptimizer(FloorplanOptimizer):
             return blocks[payload].boundary
         return max((blocks[bid].boundary for bid in groups[-payload].members), default=0)
 
+    def _payload_members(self, payload: int, groups: Dict[int, GroupMacro]) -> List[int]:
+        if payload >= 0:
+            return [payload]
+        return groups[-payload].members
+
+    def _payload_degree(self, payload: int, hints: InitHints, groups: Dict[int, GroupMacro]) -> float:
+        return sum(hints.degree.get(bid, 0.0) for bid in self._payload_members(payload, groups))
+
+    def _payload_adjacency(
+        self,
+        a_payload: int,
+        b_payload: int,
+        hints: InitHints,
+        groups: Dict[int, GroupMacro],
+    ) -> float:
+        total = 0.0
+        for a in self._payload_members(a_payload, groups):
+            neighbors = hints.adjacency.get(a, {})
+            for b in self._payload_members(b_payload, groups):
+                total += neighbors.get(b, 0.0)
+        return total
+
+    def _payload_mibs(
+        self,
+        payload: int,
+        blocks: Dict[int, BlockInfo],
+        groups: Dict[int, GroupMacro],
+    ) -> set:
+        return {
+            blocks[bid].mib
+            for bid in self._payload_members(payload, groups)
+            if blocks[bid].mib > 0
+        }
+
+    def _payloads_share_mib(
+        self,
+        a_payload: int,
+        b_payload: int,
+        blocks: Dict[int, BlockInfo],
+        groups: Dict[int, GroupMacro],
+    ) -> bool:
+        return bool(self._payload_mibs(a_payload, blocks, groups) & self._payload_mibs(b_payload, blocks, groups))
+
     def _anneal(
         self,
         state: SearchState,
@@ -1135,8 +1231,8 @@ class MyOptimizer(FloorplanOptimizer):
 
     def _perturb(self, state: SearchState, phase: str) -> None:
         choices = ["swap", "move", "rotate", "reshape_mul", "reshape_div"]
-        if phase == "high" and state.groups:
-            choices.append("subtree")
+        if state.groups:
+            choices.extend(["subtree", "group_swap"])
         move = random.choice(choices)
 
         if move == "swap":
@@ -1145,6 +1241,8 @@ class MyOptimizer(FloorplanOptimizer):
             state.tree.move_delete_insert()
         elif move == "subtree":
             random.choice(list(state.groups.values())).tree.move_delete_insert()
+        elif move == "group_swap":
+            random.choice(list(state.groups.values())).tree.move_swap_payloads()
         else:
             keys = state.shape.soft_shape_keys()
             if not keys:
@@ -1220,9 +1318,9 @@ class MyOptimizer(FloorplanOptimizer):
         return (
             1.00 * hpwl_norm
             + 1.15 * area_norm
-            + 0.50 * boundary_norm
-            + 0.35 * group_norm
-            + 0.25 * official_soft
+            + 0.55 * boundary_norm
+            + 0.30 * group_norm
+            + 0.85 * official_soft
         )
 
     def _fast_hpwl(
@@ -1304,6 +1402,34 @@ class MyOptimizer(FloorplanOptimizer):
                 penalty += abs(y - y_min)
         return penalty
 
+    def _boundary_violation_count(
+        self,
+        positions: List[Tuple[float, float, float, float]],
+        blocks: Dict[int, BlockInfo],
+    ) -> int:
+        x_min = min(x for x, y, w, h in positions)
+        y_min = min(y for x, y, w, h in positions)
+        x_max = max(x + w for x, y, w, h in positions)
+        y_max = max(y + h for x, y, w, h in positions)
+        violation = 0
+        for bid, block in blocks.items():
+            code = block.boundary
+            if code == 0:
+                continue
+            x, y, w, h = positions[bid]
+            touches = True
+            if code & 1:
+                touches = touches and abs(x - x_min) < 1e-6
+            if code & 2:
+                touches = touches and abs(x + w - x_max) < 1e-6
+            if code & 4:
+                touches = touches and abs(y + h - y_max) < 1e-6
+            if code & 8:
+                touches = touches and abs(y - y_min) < 1e-6
+            if not touches:
+                violation += 1
+        return violation
+
     def _group_penalty(
         self,
         positions: List[Tuple[float, float, float, float]],
@@ -1338,9 +1464,7 @@ class MyOptimizer(FloorplanOptimizer):
         for bid, block in blocks.items():
             if block.boundary:
                 n_soft += 1
-        boundary_dist = self._boundary_penalty(positions, blocks)
-        if boundary_dist > 1e-5:
-            violation += 1
+        violation += self._boundary_violation_count(positions, blocks)
 
         for groups in (self._ids_by_attr(blocks, "cluster"), self._ids_by_attr(blocks, "mib")):
             for members in groups.values():
@@ -1395,6 +1519,87 @@ class MyOptimizer(FloorplanOptimizer):
                 if (vertical_touch and y_overlap > 1e-5) or (horizontal_touch and x_overlap > 1e-5):
                     union(a, b)
         return len({find(i) for i in members})
+
+    def _legalize_boundary_blocks(
+        self,
+        positions: List[Tuple[float, float, float, float]],
+        b2b: torch.Tensor,
+        p2b: torch.Tensor,
+        pins: torch.Tensor,
+        blocks: Dict[int, BlockInfo],
+    ) -> List[Tuple[float, float, float, float]]:
+        current = list(positions)
+        current_cost = self._cost(current, b2b, p2b, pins, blocks, "low")
+        if not math.isfinite(current_cost) or not self._exact_overlap_free(current):
+            return positions
+
+        candidates = [
+            bid for bid, block in blocks.items()
+            if (
+                block.boundary
+                and block.cluster == 0
+                and block.mib == 0
+                and not block.is_preplaced
+            )
+        ]
+        candidates.sort(key=lambda bid: (-self._boundary_move_distance(current, bid, blocks[bid].boundary), bid))
+
+        improved = True
+        while improved:
+            improved = False
+            for bid in candidates:
+                proposal = self._boundary_snap_candidate(current, bid, blocks[bid].boundary)
+                if proposal is None:
+                    continue
+                if proposal[bid] == current[bid]:
+                    continue
+                if not self._hard_feasible(proposal, blocks) or not self._exact_overlap_free(proposal):
+                    continue
+                new_cost = self._cost(proposal, b2b, p2b, pins, blocks, "low")
+                if new_cost + 1e-9 < current_cost:
+                    current = proposal
+                    current_cost = new_cost
+                    improved = True
+        return current
+
+    def _boundary_snap_candidate(
+        self,
+        positions: List[Tuple[float, float, float, float]],
+        bid: int,
+        code: int,
+    ) -> Optional[List[Tuple[float, float, float, float]]]:
+        if code == 0:
+            return None
+        x_min = min(x for x, y, w, h in positions)
+        y_min = min(y for x, y, w, h in positions)
+        x_max = max(x + w for x, y, w, h in positions)
+        y_max = max(y + h for x, y, w, h in positions)
+        x, y, w, h = positions[bid]
+        nx, ny = x, y
+        if code & 1:
+            nx = x_min
+        if code & 2:
+            nx = x_max - w
+        if code & 4:
+            ny = y_max - h
+        if code & 8:
+            ny = y_min
+        proposal = list(positions)
+        proposal[bid] = (nx, ny, w, h)
+        return proposal
+
+    def _boundary_move_distance(
+        self,
+        positions: List[Tuple[float, float, float, float]],
+        bid: int,
+        code: int,
+    ) -> float:
+        proposal = self._boundary_snap_candidate(positions, bid, code)
+        if proposal is None:
+            return 0.0
+        x, y, _, _ = positions[bid]
+        nx, ny, _, _ = proposal[bid]
+        return abs(nx - x) + abs(ny - y)
 
     def _net_weight(self, conn: torch.Tensor) -> float:
         if conn is None or len(conn) == 0:
