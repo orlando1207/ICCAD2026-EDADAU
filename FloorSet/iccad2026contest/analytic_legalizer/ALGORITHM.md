@@ -6,9 +6,9 @@ Solves fixed-outline rectangular floorplanning for FloorSet-Lite (n = 5–120 bl
 Design is driven by the e^n-weighted score: test 99 (n=120) ≈ 64% of total weight,
 test 98 ≈ 23%, test 97 ≈ 9% — the largest cases are essentially the whole score.
 
-**Current results:** 100/100 feasible, weighted total score ≈ **1.97** (`N_STARTS=1`,
-~6.6 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector reaches
-≈ **1.88** at ~4× runtime (~26 s/100).
+**Current results:** 100/100 feasible, weighted total score ≈ **1.86** (`N_STARTS=1`,
+~7 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector can lower it
+further at ~4× runtime.
 
 Pipeline: `parse → MIB unify → boundary-aware cluster pre-pack → analytic place →
 skyline legalize → gap-fill finetune → boundary slide → hard enforce`.
@@ -74,12 +74,15 @@ Each cluster → one rigid `SuperBlock(members, offsets, w, h)`.
 - Super-block inherits the OR of member boundary codes.
 
 ### Step 3 — Analytic placement (`quadratic_placer.py: analytic_place`)
-- Quadratic wirelength min `Σ w_e[(Δx)²+(Δy)²]` from `b2b`/`p2b`; preplaced = Dirichlet
-  anchors; clusters = single node; solve `A·x=b` with numpy (n≤120).
-- 30 pairwise-repulsion spreading iterations to reduce overlap.
+- **Bound2Bound HPWL model:** start from a quadratic solve `Σ w·(Δx²+Δy²)`, then iterate
+  (`n_wl_iters=3`) reweighting each edge `w ← w0 / max(|Δ|, ε)` per axis → the quadratic
+  minimiser converges to the *linear* HPWL optimum (the score's metric). Separate Ax/Ay
+  systems (per-axis weights); preplaced = Dirichlet anchors; clusters = single node.
+- **Light spreading (`n_spread_iters=10`).** Heavy spreading is counterproductive here: it
+  scrambles the WL-optimal solve, and the skyline legalizer removes overlap itself. Going
+  from 30→10 (and adding B2B) lowered the score ~1.97→1.86.
 - Output: per-block centers `cx, cy` (the *guide* for legalization).
-- Seed 0 = no noise (deterministic, wirelength-optimal). Seeds 1+ add Gaussian noise
-  (only used when `N_STARTS>1`).
+- Seed 0 = no noise (deterministic). Seeds 1+ add Gaussian noise (only if `N_STARTS>1`).
 
 ### Step 4 — Skyline legalization (`skyline_legalizer.py: skyline_legalize`) — core
 Deterministic constructive strip-packing guided by the analytic positions.
@@ -155,7 +158,8 @@ class SuperBlock:
 |-----------|----------|-------|---------|
 | `N_STARTS` | `optimizer.py` | 1 | analytic seeds (set 4 for area·HPWL multistart) |
 | `NOISE_STD` | `optimizer.py` | 0.12 | per-seed Gaussian noise (only if N_STARTS>1) |
-| `n_spread_iters` | `quadratic_placer.py` | 30 | analytic spreading iterations |
+| `n_wl_iters` | `quadratic_placer.py` | 3 | Bound2Bound HPWL reweighting iterations |
+| `n_spread_iters` | `quadratic_placer.py` | 10 | analytic spreading iterations (kept low) |
 | `lam` (λ) | `skyline_legalizer.py` | 0.3 | skyline density-vs-HPWL weight |
 | aspect ladder | `skyline_legalizer.py` | {bbox,1.0,1.3,1.6,2.0,2.5} | candidate container widths |
 | finetune passes | `skyline_legalizer.py` | 6 | gap-fill refinement passes |

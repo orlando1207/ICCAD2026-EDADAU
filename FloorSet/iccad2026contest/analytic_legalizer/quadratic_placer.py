@@ -22,9 +22,10 @@ def analytic_place(
     b2b_connectivity: torch.Tensor,
     p2b_connectivity: torch.Tensor,
     pins_pos: torch.Tensor,
-    n_spread_iters: int = 30,
+    n_spread_iters: int = 10,
     seed: int = 0,
     noise_std: float = 0.0,
+    n_wl_iters: int = 3,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns (cx, cy): center coordinates for ALL original blocks.
@@ -82,27 +83,18 @@ def analytic_place(
     total_area = sum(node_widths[k] * node_heights[k] for k in range(num_nodes))
     chip_side = math.sqrt(total_area) * 1.2  # 20% utilization margin
 
-    # --- Build quadratic system Ax = bx, Ay = by ---
-    # For each edge (i,j,w): add w*[(ci-cj)²] -> W[i,i]+=w, W[j,j]+=w, W[i,j]-=w
-    A  = np.zeros((num_nodes, num_nodes), dtype=np.float64)
-    bx = np.zeros(num_nodes, dtype=np.float64)
-    by = np.zeros(num_nodes, dtype=np.float64)
-
-    # b2b edges
+    # --- Collect edges (node indices + base weight) ---
+    b2b_edges: List[Tuple[int, int, float]] = []
     b2b = b2b_connectivity
     if b2b is not None and b2b.numel() > 0:
         b2b_np = b2b.numpy() if isinstance(b2b, torch.Tensor) else b2b
         for edge in b2b_np:
             bi, bj, w = int(edge[0]), int(edge[1]), float(edge[2])
             ni, nj = block_to_node[bi], block_to_node[bj]
-            if ni == nj:
-                continue
-            A[ni, ni] += w
-            A[nj, nj] += w
-            A[ni, nj] -= w
-            A[nj, ni] -= w
+            if ni != nj:
+                b2b_edges.append((ni, nj, w))
 
-    # p2b edges (pins are fixed)
+    p2b_edges: List[Tuple[int, float, float, float]] = []
     p2b = p2b_connectivity
     pins = pins_pos
     if p2b is not None and p2b.numel() > 0:
@@ -111,50 +103,66 @@ def analytic_place(
         for edge in p2b_np:
             pi, bi, w = int(edge[0]), int(edge[1]), float(edge[2])
             ni = block_to_node[bi]
-            px, py = float(pins_np[pi, 0]), float(pins_np[pi, 1])
-            A[ni, ni] += w
-            bx[ni]    += w * px
-            by[ni]    += w * py
+            p2b_edges.append((ni, float(pins_np[pi, 0]), float(pins_np[pi, 1]), w))
 
-    # --- Fix preplaced nodes (Dirichlet) ---
-    # Replace their rows/cols: A[i,i]=1, b[i]=fixed_c, zero off-diag contributions
-    for nf, cx_fixed in node_fixed_x.items():
-        cy_fixed = node_fixed_y[nf]
-        # Transfer contributions to RHS
+    has_anchors = len(node_fixed_x) > 0 or len(p2b_edges) > 0
+    EPS_WL = 1.0  # avoids div-by-zero / over-weighting in the B2B reweighting
+
+    def _build_solve(cxr, cyr, linear):
+        """Build & solve the (optionally B2B-reweighted) system. With linear=True
+        each edge weight is divided by its current span → the quadratic minimiser
+        converges to the linear HPWL optimum. Separate Ax/Ay (per-axis weights)."""
+        Ax = np.zeros((num_nodes, num_nodes), dtype=np.float64)
+        Ay = np.zeros((num_nodes, num_nodes), dtype=np.float64)
+        bx = np.zeros(num_nodes, dtype=np.float64)
+        by = np.zeros(num_nodes, dtype=np.float64)
+        for (ni, nj, w0) in b2b_edges:
+            if linear:
+                wx = w0 / max(abs(cxr[ni] - cxr[nj]), EPS_WL)
+                wy = w0 / max(abs(cyr[ni] - cyr[nj]), EPS_WL)
+            else:
+                wx = wy = w0
+            Ax[ni, ni] += wx; Ax[nj, nj] += wx; Ax[ni, nj] -= wx; Ax[nj, ni] -= wx
+            Ay[ni, ni] += wy; Ay[nj, nj] += wy; Ay[ni, nj] -= wy; Ay[nj, ni] -= wy
+        for (ni, px, py, w0) in p2b_edges:
+            if linear:
+                wx = w0 / max(abs(cxr[ni] - px), EPS_WL)
+                wy = w0 / max(abs(cyr[ni] - py), EPS_WL)
+            else:
+                wx = wy = w0
+            Ax[ni, ni] += wx; bx[ni] += wx * px
+            Ay[ni, ni] += wy; by[ni] += wy * py
+        # Dirichlet: pin preplaced nodes to their fixed center.
+        for nf, cxf in node_fixed_x.items():
+            cyf = node_fixed_y[nf]
+            for k in range(num_nodes):
+                if k != nf:
+                    bx[k] -= Ax[k, nf] * cxf; Ax[k, nf] = 0.0; Ax[nf, k] = 0.0
+                    by[k] -= Ay[k, nf] * cyf; Ay[k, nf] = 0.0; Ay[nf, k] = 0.0
+            Ax[nf, nf] = 1.0; bx[nf] = cxf
+            Ay[nf, nf] = 1.0; by[nf] = cyf
+        # Weak spring to chip centre for otherwise-disconnected nodes.
         for k in range(num_nodes):
-            if k != nf:
-                bx[k] -= A[k, nf] * cx_fixed
-                by[k] -= A[k, nf] * cy_fixed
-                A[k, nf] = 0.0
-                A[nf, k] = 0.0
-        A[nf, nf] = 1.0
-        bx[nf] = cx_fixed
-        by[nf] = cy_fixed
-
-    # --- Check if system is well-anchored (has fixed nodes or p2b edges) ---
-    has_anchors = len(node_fixed_x) > 0 or (p2b_connectivity is not None and p2b_connectivity.numel() > 0)
+            if abs(Ax[k, k]) < 1e-12:
+                Ax[k, k] += 1e-3; bx[k] += 1e-3 * (chip_side / 2.0)
+            if abs(Ay[k, k]) < 1e-12:
+                Ay[k, k] += 1e-3; by[k] += 1e-3 * (chip_side / 2.0)
+        try:
+            cxs = np.linalg.solve(Ax, bx)
+            cys = np.linalg.solve(Ay, by)
+        except np.linalg.LinAlgError:
+            cxs = _grid_init(num_nodes, node_widths, node_heights, chip_side)
+            cys = _grid_init(num_nodes, node_heights, node_widths, chip_side)
+        for nf, cxf in node_fixed_x.items():
+            cxs[nf] = cxf; cys[nf] = node_fixed_y[nf]
+        return cxs, cys
 
     if has_anchors:
-        # Add weak spring to chip center only for truly disconnected nodes
-        for k in range(num_nodes):
-            if abs(A[k, k]) < 1e-12:
-                eps = 1e-3
-                A[k, k] += eps
-                bx[k]   += eps * (chip_side / 2.0)
-                by[k]   += eps * (chip_side / 2.0)
-        # Solve the anchored system
-        try:
-            cx = np.linalg.solve(A, bx)
-            cy = np.linalg.solve(A, by)
-        except np.linalg.LinAlgError:
-            cx = _grid_init(num_nodes, node_widths, node_heights, chip_side)
-            cy = _grid_init(num_nodes, node_heights, node_widths, chip_side)
-        # Keep preplaced fixed after solve (numerical safety)
-        for nf, cx_fixed in node_fixed_x.items():
-            cx[nf] = cx_fixed
-            cy[nf] = node_fixed_y[nf]
+        cx, cy = _build_solve(None, None, linear=False)   # quadratic init
+        for _ in range(n_wl_iters):                        # B2B reweight → HPWL
+            cx, cy = _build_solve(cx, cy, linear=True)
     else:
-        # No anchors: Laplacian is rank-deficient. Skip linear solve, use grid init.
+        # No anchors: Laplacian is rank-deficient. Use grid init.
         cx, cy = _grid_init_xy(num_nodes, node_widths, node_heights, chip_side)
 
     # --- Optional noise injection (for multistart diversity) ---
