@@ -208,6 +208,28 @@ def _pack_one_width(
     return placement
 
 
+def _raw_hpwl(positions, b2b, p2b, pins) -> float:
+    """Raw half-perimeter wirelength (b2b + p2b) on block centers; 0 if no nets."""
+    if b2b is None and p2b is None:
+        return 0.0
+    total = 0.0
+    if b2b is not None and len(b2b) > 0:
+        for e in b2b:
+            i, j, w = int(e[0]), int(e[1]), float(e[2])
+            if i < 0 or j < 0:
+                continue
+            xi, yi, wi, hi = positions[i]; xj, yj, wj, hj = positions[j]
+            total += w * (abs((xi + wi / 2) - (xj + wj / 2)) + abs((yi + hi / 2) - (yj + hj / 2)))
+    if p2b is not None and len(p2b) > 0:
+        for e in p2b:
+            pi, bi, w = int(e[0]), int(e[1]), float(e[2])
+            if bi < 0:
+                continue
+            x, y, w2, h2 = positions[bi]
+            total += w * (abs((x + w2 / 2) - float(pins[pi][0])) + abs((y + h2 / 2) - float(pins[pi][1])))
+    return total
+
+
 def _count_boundary_unmet(positions, blocks, x2, y2, tol=1.0) -> int:
     bv = 0
     for i, b in enumerate(blocks):
@@ -262,9 +284,14 @@ def skyline_legalize(
     cy: np.ndarray,
     area_targets,
     lam: float = 0.3,
+    b2b=None,
+    p2b=None,
+    pins=None,
 ) -> Tuple[List[Tuple[float, float, float, float]], float]:
     """Legalize via skyline packing. Tries a ladder of container widths and
-    returns (positions, score) for the best (lowest cost-proxy) feasible width."""
+    returns (positions, score) for the best (lowest cost-proxy) feasible width.
+    Width selection uses area·HPWL·e^(2·boundary): HPWL is the dominant cost term,
+    so an area-only proxy mis-picks (chooses too-narrow boxes with worse wirelength)."""
     movable, obstacles = _build_units(blocks, super_blocks, cluster_groups, cx, cy)
 
     total_area = sum(u.w * u.h for u in movable) + sum(o[2] * o[3] for o in obstacles)
@@ -305,7 +332,8 @@ def skyline_legalize(
         x2 = max(p[0] + p[2] for p in pos)
         y2 = max(p[1] + p[3] for p in pos)
         bv = _count_boundary_unmet(pos, blocks, x2, y2)
-        score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
+        hp = _raw_hpwl(pos, b2b, p2b, pins)
+        score = (x2 * y2) * (hp if hp > 1e-9 else 1.0) * math.exp(2.0 * bv / max(n, 1))
         if score < best_score:
             best_score = score
             best_pos = pos

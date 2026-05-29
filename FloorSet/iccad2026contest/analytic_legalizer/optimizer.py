@@ -83,6 +83,7 @@ class MyOptimizer(FloorplanOptimizer):
             )
             _pos, _ = skyline_legalize(
                 blocks, super_blocks, cluster_groups, _cx, _cy, area_targets,
+                b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
             )
             _pos = slide_boundary(_pos, blocks, super_blocks, cluster_groups)
             _pos = enforce_hard(_pos, blocks, area_targets)
