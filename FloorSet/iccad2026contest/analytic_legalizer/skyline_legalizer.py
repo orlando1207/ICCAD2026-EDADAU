@@ -363,15 +363,11 @@ def skyline_legalize(
         y2 = max(p[1] + p[3] for p in best_pos)
         best_score = x2 * y2
 
-    # Finetune: tuck bbox-defining free blocks into cluster-internal whitespace
-    # to shrink the bbox (grouping unaffected — a non-member in a group's gap does
-    # not change that group's connectivity).
-    best_pos = _finetune_fill_gaps(best_pos, blocks, cluster_groups)
-    x2 = max(p[0] + p[2] for p in best_pos)
-    y2 = max(p[1] + p[3] for p in best_pos)
-    bv = _count_boundary_unmet(best_pos, blocks, x2, y2)
-    best_score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
-
+    # NB: an earlier cluster-gap finetune pass was removed here. It shrank the bbox
+    # by tucking frontier blocks into cluster whitespace, which helped when area_gap
+    # dominated, but it buries blocks far from their connected neighbours (↑HPWL) and
+    # detailed-place can't undo it. With HPWL now the dominant cost term it became a
+    # net loss (1.785 → 1.811), so it is gone (also faster).
     return best_pos, best_score
 
 
@@ -463,76 +459,4 @@ def _detailed_place(positions, blocks, b2b, p2b, pins, n_passes=5):
             pos[i] = (pos[i][0] + dx, pos[i][1], wi, hi)
             dy = _clip_axis(pos, i, _wmedian(ys) - cy_i, 1)
             pos[i] = (pos[i][0], pos[i][1] + dy, wi, hi)
-    return pos
-
-
-def _finetune_fill_gaps(positions, blocks, cluster_groups):
-    """Relocate bbox-defining free blocks into cluster-internal gaps when doing so
-    strictly shrinks the bounding box. Conservative: only frontier blocks move, and
-    only if the bbox area decreases (keeps the main packing's positions/HPWL)."""
-    pos = list(positions)
-    n = len(pos)
-    movable = [i for i, b in enumerate(blocks)
-               if not b.is_preplaced and b.cluster_group == 0]
-    clbb = []
-    for mem in cluster_groups.values():
-        xs = min(pos[m][0] for m in mem); ys = min(pos[m][1] for m in mem)
-        xe = max(pos[m][0] + pos[m][2] for m in mem)
-        ye = max(pos[m][1] + pos[m][3] for m in mem)
-        clbb.append((xs, ys, xe, ye))
-    if not clbb:
-        return pos
-
-    # Vectorized occupancy arrays (rebuilt each pass; pos only changes on a move,
-    # which breaks the pass).
-    X = np.array([p[0] for p in pos]); Y = np.array([p[1] for p in pos])
-    XE = np.array([p[0] + p[2] for p in pos]); YE = np.array([p[1] + p[3] for p in pos])
-
-    def overlaps_any(rx, ry, rw, rh, exclude):
-        ox = np.minimum(rx + rw, XE) - np.maximum(rx, X)
-        oy = np.minimum(ry + rh, YE) - np.maximum(ry, Y)
-        hit = (ox > 1e-6) & (oy > 1e-6)
-        hit[exclude] = False
-        return bool(hit.any())
-
-    for _ in range(6):
-        X[:] = [p[0] for p in pos]; Y[:] = [p[1] for p in pos]
-        XE[:] = [p[0] + p[2] for p in pos]; YE[:] = [p[1] + p[3] for p in pos]
-        x2 = max(p[0] + p[2] for p in pos)
-        y2 = max(p[1] + p[3] for p in pos)
-        area0 = x2 * y2
-        frontier = [i for i in movable
-                    if pos[i][0] + pos[i][2] > x2 - 1e-6 or pos[i][1] + pos[i][3] > y2 - 1e-6]
-        # Largest frontier blocks first (biggest bbox-shrink potential).
-        frontier.sort(key=lambda i: -pos[i][2] * pos[i][3])
-        moved = False
-        for i in frontier:
-            w, h = pos[i][2], pos[i][3]
-            step = max(1.0, min(w, h) * 0.5)
-            for (cx0, cy0, cx1, cy1) in clbb:
-                if cx1 - cx0 < w - 1e-9 or cy1 - cy0 < h - 1e-9:
-                    continue
-                gy = cy0
-                while gy <= cy1 - h + 1e-9:
-                    gx = cx0
-                    while gx <= cx1 - w + 1e-9:
-                        if not overlaps_any(gx, gy, w, h, i):
-                            old = pos[i]
-                            pos[i] = (gx, gy, w, h)
-                            nx2 = max(p[0] + p[2] for p in pos)
-                            ny2 = max(p[1] + p[3] for p in pos)
-                            if nx2 * ny2 < area0 - 1e-6:
-                                moved = True
-                                break
-                            pos[i] = old
-                        gx += step
-                    if moved:
-                        break
-                    gy += step
-                if moved:
-                    break
-            if moved:
-                break
-        if not moved:
-            break
     return pos

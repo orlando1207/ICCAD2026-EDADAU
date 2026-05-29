@@ -6,12 +6,12 @@ Solves fixed-outline rectangular floorplanning for FloorSet-Lite (n = 5–120 bl
 Design is driven by the e^n-weighted score: test 99 (n=120) ≈ 64% of total weight,
 test 98 ≈ 23%, test 97 ≈ 9% — the largest cases are essentially the whole score.
 
-**Current results:** 100/100 feasible, weighted total score ≈ **1.811** (`N_STARTS=1`,
-~3 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector can lower it
+**Current results:** 100/100 feasible, weighted total score ≈ **1.785** (`N_STARTS=1`,
+~11 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector can lower it
 further at ~4× runtime.
 
 Pipeline: `parse → MIB unify → boundary-aware cluster pre-pack → analytic place →
-skyline legalize → gap-fill finetune → boundary slide → hard enforce`.
+skyline legalize → detailed place → boundary slide → hard enforce`.
 
 > The legacy longest-path/shaping/compact modules (`topology.py`, `shaping.py`) are
 > retained for reference and unit tests but are **no longer on the active path** —
@@ -98,8 +98,7 @@ Deterministic constructive strip-packing guided by the analytic positions.
   ~0.9 with the GT aspect. It's added as a candidate width and used as a *mild* selection
   prior (`score ·= 1 + 0.5·|ln(cand_aspect / asp_pred)|`) — the proxy alone mis-picks, and the
   prediction is informative-but-noisy so a gentle nudge wins (strong priors regress). ~1.827→1.811.
-  Pack each, keep min `area·e^(2·boundary/n)`. A *fixed* W gives real L/R/B edges (the
-  emergent-bbox of the old packer could not).
+  A *fixed* W gives real L/R/B edges (the emergent-bbox of the old packer could not).
 - **`Skyline`:** contour of contiguous `[x_start, x_end, height]` segments over `[0,W]`.
 - **Placement** (units = free blocks + rigid cluster boxes), sorted by analytic `(cy, cx)`
   with BOTTOM-forced first, TOP-forced last: for each candidate x, landing
@@ -114,12 +113,11 @@ Deterministic constructive strip-packing guided by the analytic positions.
   blocks nest into the cluster's internal pockets (grouping unaffected; the evaluator only
   unions a group's own members).
 
-### Step 5 — Gap-fill finetune (`skyline_legalizer.py: _finetune_fill_gaps`)
-Post-pass: relocate bbox-defining (frontier) free blocks into cluster-internal gaps **only
-if it strictly shrinks the bbox**. Conservative — preserves the main packing's positions
-and HPWL; can't regress.
+> A gap-fill finetune (tuck frontier free blocks into cluster whitespace) used to run here.
+> It helped when area_gap dominated but became a net loss once HPWL dominated — it buries a
+> block far from its neighbours (↑HPWL) for a tiny area gain — so it was removed (1.811→1.785).
 
-### Step 5.5 — HPWL detailed placement (`skyline_legalizer.py: _detailed_place`)
+### Step 5 — HPWL detailed placement (`skyline_legalizer.py: _detailed_place`)
 Post-legalization wirelength cleanup: slide each **interior** free block (not preplaced,
 not in a cluster, **no boundary code**) toward the weighted median of its connected
 neighbours' centres — the HPWL-optimal point — clipped to stay overlap-free. Moving toward
@@ -180,7 +178,6 @@ class SuperBlock:
 | `n_spread_iters` | `quadratic_placer.py` | 10 | analytic spreading iterations (kept low) |
 | `lam` (λ) | `skyline_legalizer.py` | 0.3 | skyline density-vs-HPWL weight |
 | aspect ladder | `skyline_legalizer.py` | {bbox,0.4,0.6,0.8,1.0,1.3,1.6,2.0,2.5} | candidate widths (H/W; <1 = wide) |
-| finetune passes | `skyline_legalizer.py` | 6 | gap-fill refinement passes |
 | resolve passes | `constraints.py` | 80 | overlap resolution before escape |
 | area nudge limit | `constraints.py` | 1.1% | max relative area correction (8b) |
 | ULP snap tol | `constraints.py` | 1e-6 | intra-cluster abutment snap (8d) |
