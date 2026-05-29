@@ -330,6 +330,97 @@ def skyline_legalize(
     return best_pos, best_score
 
 
+def _clip_axis(pos, i, delta, axis):
+    """Largest move of block i by `delta` along `axis` (0=x,1=y) that creates no
+    overlap with any perpendicular-aligned block and keeps it at coord >= 0."""
+    if abs(delta) < 1e-9:
+        return 0.0
+    xi, yi, wi, hi = pos[i]
+    lo_i = xi if axis == 0 else yi
+    sz_i = wi if axis == 0 else hi
+    plo_i = yi if axis == 0 else xi
+    psz_i = hi if axis == 0 else wi
+    for k in range(len(pos)):
+        if k == i:
+            continue
+        xk, yk, wk, hk = pos[k]
+        plo_k = yk if axis == 0 else xk
+        psz_k = hk if axis == 0 else wk
+        if min(plo_i + psz_i, plo_k + psz_k) - max(plo_i, plo_k) <= 1e-6:
+            continue  # no perpendicular overlap → can't collide along this axis
+        lo_k = xk if axis == 0 else yk
+        sz_k = wk if axis == 0 else hk
+        if delta > 0 and lo_k >= lo_i + sz_i - 1e-6:
+            delta = min(delta, lo_k - (lo_i + sz_i))
+        elif delta < 0 and lo_k + sz_k <= lo_i + 1e-6:
+            delta = max(delta, (lo_k + sz_k) - lo_i)
+    if delta < 0:
+        delta = max(delta, -lo_i)
+    return delta
+
+
+def _wmedian(vals_w):
+    """Weighted median of [(value, weight), ...]."""
+    if not vals_w:
+        return None
+    vals_w = sorted(vals_w)
+    tot = sum(w for _, w in vals_w)
+    acc = 0.0
+    for v, w in vals_w:
+        acc += w
+        if acc >= tot / 2.0:
+            return v
+    return vals_w[-1][0]
+
+
+def _detailed_place(positions, blocks, b2b, p2b, pins, n_passes=5):
+    """HPWL detailed placement: slide each free block toward the weighted-median
+    of its connected neighbours (the HPWL-optimal point), clipped to stay legal.
+    Moving toward the median is monotone non-increasing in HPWL → safe & convergent.
+    Preplaced and cluster members are not moved."""
+    pos = list(positions)
+    n = len(pos)
+    # Only move interior free blocks: a boundary block dragged toward its neighbours
+    # loses its edge → V_rel (e^2·) penalty far outweighs the HPWL gain.
+    movable = [i for i, b in enumerate(blocks)
+               if not b.is_preplaced and b.cluster_group == 0 and b.boundary_code == 0]
+    if not movable:
+        return pos
+    nb = [[] for _ in range(n)]  # neighbour list: (kind, data, weight)
+    if b2b is not None and len(b2b) > 0:
+        for e in b2b:
+            i, j, w = int(e[0]), int(e[1]), float(e[2])
+            if i < 0 or j < 0:
+                continue
+            nb[i].append(('b', j, w)); nb[j].append(('b', i, w))
+    if p2b is not None and len(p2b) > 0:
+        for e in p2b:
+            pi, bi, w = int(e[0]), int(e[1]), float(e[2])
+            if bi < 0:
+                continue
+            px, py = float(pins[pi][0]), float(pins[pi][1])
+            nb[bi].append(('p', (px, py), w))
+
+    for _ in range(n_passes):
+        for i in movable:
+            if not nb[i]:
+                continue
+            xi, yi, wi, hi = pos[i]
+            cx_i, cy_i = xi + wi / 2.0, yi + hi / 2.0
+            xs, ys = [], []
+            for (t, d, w) in nb[i]:
+                if t == 'b':
+                    xk, yk, wk, hk = pos[d]
+                    xs.append((xk + wk / 2.0, w)); ys.append((yk + hk / 2.0, w))
+                else:
+                    xs.append((d[0], w)); ys.append((d[1], w))
+            dx = _clip_axis(pos, i, _wmedian(xs) - cx_i, 0)
+            pos[i] = (pos[i][0] + dx, pos[i][1], wi, hi)
+            dy = _clip_axis(pos, i, _wmedian(ys) - cy_i, 1)
+            pos[i] = (pos[i][0], pos[i][1] + dy, wi, hi)
+    return pos
+
+
 def _finetune_fill_gaps(positions, blocks, cluster_groups):
     """Relocate bbox-defining free blocks into cluster-internal gaps when doing so
     strictly shrinks the bounding box. Conservative: only frontier blocks move, and

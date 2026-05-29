@@ -21,7 +21,7 @@ from .constraints import (
     slide_boundary, enforce_hard,
 )
 from .quadratic_placer import analytic_place
-from .skyline_legalizer import skyline_legalize
+from .skyline_legalizer import skyline_legalize, _detailed_place
 
 
 class MyOptimizer(FloorplanOptimizer):
@@ -86,6 +86,11 @@ class MyOptimizer(FloorplanOptimizer):
             )
             _pos = slide_boundary(_pos, blocks, super_blocks, cluster_groups)
             _pos = enforce_hard(_pos, blocks, area_targets)
+            # HPWL detailed placement: slide free blocks toward their wirelength
+            # optimum, clipped to stay overlap-free (legality preserved).
+            _pos = _detailed_place(
+                _pos, blocks, b2b_connectivity, p2b_connectivity, pins_pos,
+            )
 
             if N_STARTS == 1:
                 return _pos  # single candidate — skip the (expensive) selection proxy

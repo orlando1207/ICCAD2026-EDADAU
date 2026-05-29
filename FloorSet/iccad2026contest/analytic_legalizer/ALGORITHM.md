@@ -6,8 +6,8 @@ Solves fixed-outline rectangular floorplanning for FloorSet-Lite (n = 5–120 bl
 Design is driven by the e^n-weighted score: test 99 (n=120) ≈ 64% of total weight,
 test 98 ≈ 23%, test 97 ≈ 9% — the largest cases are essentially the whole score.
 
-**Current results:** 100/100 feasible, weighted total score ≈ **1.86** (`N_STARTS=1`,
-~7 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector can lower it
+**Current results:** 100/100 feasible, weighted total score ≈ **1.83** (`N_STARTS=1`,
+~3 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector can lower it
 further at ~4× runtime.
 
 Pipeline: `parse → MIB unify → boundary-aware cluster pre-pack → analytic place →
@@ -109,6 +109,14 @@ Deterministic constructive strip-packing guided by the analytic positions.
 Post-pass: relocate bbox-defining (frontier) free blocks into cluster-internal gaps **only
 if it strictly shrinks the bbox**. Conservative — preserves the main packing's positions
 and HPWL; can't regress.
+
+### Step 5.5 — HPWL detailed placement (`skyline_legalizer.py: _detailed_place`)
+Post-legalization wirelength cleanup: slide each **interior** free block (not preplaced,
+not in a cluster, **no boundary code**) toward the weighted median of its connected
+neighbours' centres — the HPWL-optimal point — clipped to stay overlap-free. Moving toward
+the median is monotone non-increasing in HPWL, so it's safe and convergent (a few passes).
+Boundary blocks are excluded: dragging one off its edge spikes V_rel (the `e^2·` term) far
+more than the HPWL gain is worth. Full-100: ~1.859 → ~1.834.
 
 ### Step 6 — Boundary slide (`constraints.py: slide_boundary`)
 Slide remaining RIGHT/TOP (and corner) blocks to the bbox edge, clipping to avoid new
