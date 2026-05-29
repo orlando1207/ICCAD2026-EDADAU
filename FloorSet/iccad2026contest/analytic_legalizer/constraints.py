@@ -427,6 +427,51 @@ def enforce_hard(
     # 8c: resolve overlaps by minimal push (never push preplaced/fixed)
     pos = _resolve_overlaps(pos, blocks)
 
+    # 8d: snap intra-cluster abutting edges to bit-identical values.
+    # The cluster super-block is rigid, but member absolute coords come from
+    # cumulative-sum offsets, while the evaluator recomputes a neighbour's edge
+    # as (anchor+off)+w.  Float non-associativity leaves abutting edges ~1 ULP
+    # apart at large coords, which shapely.unary_union counts as a separate
+    # connected component (a spurious grouping violation).  Aligning the edge to
+    # the neighbour's exact value (correction ≈1e-14) makes them merge.
+    pos = _snap_cluster_abutment(pos, blocks)
+
+    return pos
+
+
+def _snap_cluster_abutment(
+    positions: List[Tuple[float, float, float, float]],
+    blocks: List[BlockInfo],
+) -> List[Tuple[float, float, float, float]]:
+    """Close sub-epsilon gaps between cluster-mates so shared edges are bit-equal."""
+    pos = list(positions)
+    cluster_members: Dict[int, List[int]] = {}
+    for i, b in enumerate(blocks):
+        if b.cluster_group > 0:
+            cluster_members.setdefault(b.cluster_group, []).append(i)
+
+    SNAP = 1e-6  # only closes ULP-scale gaps; far below the 1e-6 overlap threshold
+    for mem in cluster_members.values():
+        for _ in range(len(mem)):
+            for a in mem:
+                ax, ay, aw, ah = pos[a]
+                for b in mem:
+                    if a == b:
+                        continue
+                    bx, by, bw, bh = pos[b]
+                    y_ov = min(ay + ah, by + bh) - max(ay, by)
+                    x_ov = min(ax + aw, bx + bw) - max(ax, bx)
+                    if y_ov > 1e-9:  # vertical shared edge
+                        if 0.0 < abs(ax - (bx + bw)) < SNAP:
+                            ax = bx + bw
+                        elif 0.0 < abs((ax + aw) - bx) < SNAP:
+                            ax = bx - aw
+                    if x_ov > 1e-9:  # horizontal shared edge
+                        if 0.0 < abs(ay - (by + bh)) < SNAP:
+                            ay = by + bh
+                        elif 0.0 < abs((ay + ah) - by) < SNAP:
+                            ay = by - ah
+                    pos[a] = (ax, ay, aw, ah)
     return pos
 
 
