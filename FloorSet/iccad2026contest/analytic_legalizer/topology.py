@@ -17,7 +17,9 @@ from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
-from .constraints import BlockInfo, SuperBlock, BOUND_LEFT, BOUND_BOTTOM
+from .constraints import (
+    BlockInfo, SuperBlock, BOUND_LEFT, BOUND_BOTTOM, BOUND_RIGHT, BOUND_TOP,
+)
 
 
 def build_topology(
@@ -181,6 +183,42 @@ def build_topology(
         rj = corner_sorted[k + 1]
         if (ri, rj) not in vcg_adj:
             vcg_adj.add((ri, rj))
+
+    # --- RIGHT / TOP forcing (mirror of LEFT / BOTTOM) ---
+    # A RIGHT block should be the right frontier of its y-band: every block whose
+    # y-projection overlaps it must come BEFORE it in HCG (edge s→r), and it must
+    # have no HCG out-edges.  Symmetric for TOP in VCG.  Multiple RIGHT blocks in
+    # the same band are stacked in VCG so they don't all collide at the frontier.
+    right_forced: Set[int] = {r for r in reps if rep_bc[r] & BOUND_RIGHT}
+    top_forced:   Set[int] = {r for r in reps if rep_bc[r] & BOUND_TOP}
+
+    for r in right_forced:
+        for s in reps:
+            if s == r or s in right_forced:
+                continue
+            y_ov = min(y2(r), y2(s)) - max(y1(r), y1(s))
+            if y_ov > -1e-6:
+                hcg_adj.discard((r, s))  # r has no out-edges
+                hcg_adj.add((s, r))      # s is left of r
+    right_sorted = sorted(right_forced, key=lambda r: rep_cy[r])
+    for k in range(len(right_sorted) - 1):
+        ri, rj = right_sorted[k], right_sorted[k + 1]
+        if (ri, rj) not in vcg_adj and (rj, ri) not in vcg_adj:
+            vcg_adj.add((ri, rj))
+
+    for r in top_forced:
+        for s in reps:
+            if s == r or s in top_forced:
+                continue
+            x_ov = min(x2(r), x2(s)) - max(x1(r), x1(s))
+            if x_ov > -1e-6:
+                vcg_adj.discard((r, s))
+                vcg_adj.add((s, r))
+    top_sorted = sorted(top_forced, key=lambda r: rep_cx[r])
+    for k in range(len(top_sorted) - 1):
+        ri, rj = top_sorted[k], top_sorted[k + 1]
+        if (ri, rj) not in hcg_adj and (rj, ri) not in hcg_adj:
+            hcg_adj.add((ri, rj))
 
     # For pairs that are diagonally separated (no projection overlap in either axis),
     # force an HCG edge based on cx order to prevent both landing at x=0.
