@@ -19,8 +19,7 @@ from .constraints import (
     slide_boundary, enforce_hard,
 )
 from .quadratic_placer import analytic_place
-from .topology import build_topology, longest_path_pack, augment_topology, compact
-from .shaping import shape_soft_blocks
+from .skyline_legalizer import skyline_legalize
 
 
 class MyOptimizer(FloorplanOptimizer):
@@ -72,49 +71,22 @@ class MyOptimizer(FloorplanOptimizer):
         for _start in range(N_STARTS):
             seed = _start  # seed 0 → no noise (baseline)
 
-            # Step 3
+            # Step 3: analytic global placement
             _cx, _cy = analytic_place(
                 blocks, super_blocks, cluster_groups,
                 b2b_connectivity, p2b_connectivity, pins_pos,
                 seed=seed, noise_std=(NOISE_STD if seed > 0 else 0.0),
             )
 
-            # Step 4
-            _hcg, _vcg = build_topology(
-                _cx, _cy, blocks, super_blocks, cluster_groups
+            # Steps 4–6: skyline strip-packing legalization (replaces topology /
+            # longest-path / shaping / compact). Returns a cost-proxy score used
+            # to select across analytic seeds.
+            _pos, _score = skyline_legalize(
+                blocks, super_blocks, cluster_groups, _cx, _cy, area_targets,
             )
-
-            # Step 5 + 5b
-            _pos = longest_path_pack(_hcg, _vcg, blocks, super_blocks, cluster_groups)
-            for _ in range(15):
-                if not augment_topology(_pos, blocks, super_blocks, cluster_groups,
-                                        _hcg, _vcg):
-                    break
-                _pos = longest_path_pack(_hcg, _vcg, blocks, super_blocks, cluster_groups)
-
-            # Step 6
-            _pos = shape_soft_blocks(
-                _pos, blocks, super_blocks, cluster_groups,
-                mib_groups, area_targets, _hcg, _vcg,
-            )
-
-            # Step 6b
-            for _ in range(15):
-                _pos = longest_path_pack(_hcg, _vcg, blocks, super_blocks, cluster_groups)
-                if not augment_topology(_pos, blocks, super_blocks, cluster_groups,
-                                        _hcg, _vcg):
-                    break
-
-            # Step 6c
-            _pos = compact(_pos, blocks, super_blocks, cluster_groups)
-
-            _x2 = max(p[0] + p[2] for p in _pos)
-            _y2 = max(p[1] + p[3] for p in _pos)
-            _area = _x2 * _y2
-            if _area < best_bbox_area:
-                best_bbox_area = _area
-                best_positions  = _pos
-                hcg_succ, vcg_succ = _hcg, _vcg
+            if _score < best_bbox_area:
+                best_bbox_area = _score
+                best_positions = _pos
 
         positions = best_positions
 
