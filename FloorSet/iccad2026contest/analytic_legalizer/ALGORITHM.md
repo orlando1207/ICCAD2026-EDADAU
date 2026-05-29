@@ -6,7 +6,7 @@ Solves fixed-outline rectangular floorplanning for FloorSet-Lite (n = 5–120 bl
 Design is driven by the e^n-weighted score: test 99 (n=120) ≈ 64% of total weight,
 test 98 ≈ 23%, test 97 ≈ 9% — the largest cases are essentially the whole score.
 
-**Current results:** 100/100 feasible, weighted total score ≈ **1.827** (`N_STARTS=1`,
+**Current results:** 100/100 feasible, weighted total score ≈ **1.811** (`N_STARTS=1`,
 ~3 s for all 100 cases). Optional `N_STARTS=4` with an area·HPWL selector can lower it
 further at ~4× runtime.
 
@@ -92,6 +92,12 @@ Deterministic constructive strip-packing guided by the analytic positions.
   Each candidate is scored by **area · HPWL · e^(2·boundary)** and the min is kept — HPWL
   is the dominant cost term, so an area-only proxy mis-picks (too-narrow boxes with worse
   wirelength; e.g. case 98 it chose aspect 2.5 over the better 2.0).
+- **Boundary-derived aspect prior.** A LEFT/RIGHT block needs a vertical wall (height), a
+  TOP/BOTTOM block a horizontal wall (width), so the intended outline aspect H/W ≈
+  Σheight(LR blocks) / Σwidth(TB blocks). This physics formula (no fitted params) correlates
+  ~0.9 with the GT aspect. It's added as a candidate width and used as a *mild* selection
+  prior (`score ·= 1 + 0.5·|ln(cand_aspect / asp_pred)|`) — the proxy alone mis-picks, and the
+  prediction is informative-but-noisy so a gentle nudge wins (strong priors regress). ~1.827→1.811.
   Pack each, keep min `area·e^(2·boundary/n)`. A *fixed* W gives real L/R/B edges (the
   emergent-bbox of the old packer could not).
 - **`Skyline`:** contour of contiguous `[x_start, x_end, height]` segments over `[0,W]`.

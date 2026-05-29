@@ -311,9 +311,23 @@ def skyline_legalize(
     else:
         analytic_aspect = 1.0
 
+    # Boundary-derived aspect prior: a LEFT/RIGHT block must sit on a vertical wall
+    # (needs height), a TOP/BOTTOM block on a horizontal wall (needs width), so the
+    # intended outline aspect H/W ≈ Σheight(LR) / Σwidth(TB). This correlates ~0.9
+    # with the GT aspect — a strong physics-based prior the area·HPWL proxy lacks.
+    sh_lr, sw_tb = 1e-6, 1e-6
+    for b in blocks:
+        bc = b.boundary_code
+        if bc & BOUND_LEFT or bc & BOUND_RIGHT:
+            sh_lr += b.h
+        if bc & BOUND_TOP or bc & BOUND_BOTTOM:
+            sw_tb += b.w
+    asp_pred = min(max(sh_lr / sw_tb, 0.3), 3.2)
+    PRIOR = 0.5  # mild: prediction is informative but noisy — nudge, don't dictate
+
     # aspect = height/width: <1 = wide/short, >1 = tall/narrow. Include both so a
     # wide container can win when the instance prefers it (the score proxy selects).
-    aspects = [analytic_aspect, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
+    aspects = [analytic_aspect, asp_pred, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
     cand_W = set()
     for asp in aspects:
         asp = max(asp, 1e-3)
@@ -334,6 +348,9 @@ def skyline_legalize(
         bv = _count_boundary_unmet(pos, blocks, x2, y2)
         hp = _raw_hpwl(pos, b2b, p2b, pins)
         score = (x2 * y2) * (hp if hp > 1e-9 else 1.0) * math.exp(2.0 * bv / max(n, 1))
+        # Soft prior toward the boundary-predicted aspect.
+        cand_aspect = y2 / max(x2, 1e-6)
+        score *= 1.0 + PRIOR * abs(math.log(cand_aspect / asp_pred))
         if score < best_score:
             best_score = score
             best_pos = pos
