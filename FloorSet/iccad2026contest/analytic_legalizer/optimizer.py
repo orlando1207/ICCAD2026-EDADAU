@@ -67,8 +67,8 @@ class MyOptimizer(FloorplanOptimizer):
         # dominant cases. HPWL is computed from connectivity (no baseline needed).
         # Seed 0 = no noise (deterministic); seeds 1+ add perturbation.
         # ------------------------------------------------------------------
-        N_STARTS  = 4
-        NOISE_STD = 0.12   # fraction of chip_side added as Gaussian noise
+        N_STARTS  = 1      # single deterministic seed (no noise); fast baseline.
+        NOISE_STD = 0.12   # used only if N_STARTS > 1 (raise for multistart)
 
         best_positions = None
         best_proxy = float('inf')
