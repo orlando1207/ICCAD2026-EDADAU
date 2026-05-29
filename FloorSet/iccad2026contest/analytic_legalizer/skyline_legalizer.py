@@ -284,7 +284,9 @@ def skyline_legalize(
     else:
         analytic_aspect = 1.0
 
-    aspects = [analytic_aspect, 1.0, 1.3, 1.6, 2.0, 2.5]
+    # aspect = height/width: <1 = wide/short, >1 = tall/narrow. Include both so a
+    # wide container can win when the instance prefers it (the score proxy selects).
+    aspects = [analytic_aspect, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
     cand_W = set()
     for asp in aspects:
         asp = max(asp, 1e-3)

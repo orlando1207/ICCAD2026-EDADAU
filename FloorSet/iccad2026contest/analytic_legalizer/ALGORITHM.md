@@ -86,8 +86,9 @@ Each cluster → one rigid `SuperBlock(members, offsets, w, h)`.
 
 ### Step 4 — Skyline legalization (`skyline_legalizer.py: skyline_legalize`) — core
 Deterministic constructive strip-packing guided by the analytic positions.
-- **Container width `W`:** try a ladder of aspects `{analytic-bbox, 1.0, 1.3, 1.6, 2.0,
-  2.5}` → `W=√(area/aspect)`, clamped to `W_min` (widest unit / max preplaced right edge).
+- **Container width `W`:** try a ladder of aspects (H/W) `{analytic-bbox, 0.4, 0.6, 0.8,
+  1.0, 1.3, 1.6, 2.0, 2.5}` → `W=√(area/aspect)`, clamped to `W_min` (widest unit / max
+  preplaced right edge). Includes <1 (wide) so wide-preferring instances are reachable.
   Pack each, keep min `area·e^(2·boundary/n)`. A *fixed* W gives real L/R/B edges (the
   emergent-bbox of the old packer could not).
 - **`Skyline`:** contour of contiguous `[x_start, x_end, height]` segments over `[0,W]`.
@@ -161,7 +162,7 @@ class SuperBlock:
 | `n_wl_iters` | `quadratic_placer.py` | 3 | Bound2Bound HPWL reweighting iterations |
 | `n_spread_iters` | `quadratic_placer.py` | 10 | analytic spreading iterations (kept low) |
 | `lam` (λ) | `skyline_legalizer.py` | 0.3 | skyline density-vs-HPWL weight |
-| aspect ladder | `skyline_legalizer.py` | {bbox,1.0,1.3,1.6,2.0,2.5} | candidate container widths |
+| aspect ladder | `skyline_legalizer.py` | {bbox,0.4,0.6,0.8,1.0,1.3,1.6,2.0,2.5} | candidate widths (H/W; <1 = wide) |
 | finetune passes | `skyline_legalizer.py` | 6 | gap-fill refinement passes |
 | resolve passes | `constraints.py` | 80 | overlap resolution before escape |
 | area nudge limit | `constraints.py` | 1.1% | max relative area correction (8b) |
