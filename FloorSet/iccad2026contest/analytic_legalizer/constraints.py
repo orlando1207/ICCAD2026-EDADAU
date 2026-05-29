@@ -184,8 +184,14 @@ def prepack_clusters(
         preplaced_idx = next(
             (k for k, idx in enumerate(members) if blocks[idx].is_preplaced), None
         )
+        codes = [blocks[i].boundary_code for i in members]
         if preplaced_idx is not None:
             offsets, sb_w, sb_h = _pack_with_anchor(widths, heights, preplaced_idx)
+        elif any(c != 0 for c in codes):
+            # Boundary-aware: arrange boundary members on the matching face of the
+            # super-block so that, once the rigid box is placed against the wall,
+            # those members actually touch the required bbox edge.
+            offsets, sb_w, sb_h = _boundary_aware_pack(widths, heights, codes)
         else:
             offsets, sb_w, sb_h = _shelf_pack(widths, heights)
 
@@ -247,6 +253,84 @@ def _shelf_pack(
 
     offsets = [offsets_by_orig[i] for i in range(n)]
     return offsets, total_w, total_h
+
+
+def _boundary_aware_pack(
+    widths: List[float], heights: List[float], codes: List[int]
+) -> Tuple[List[Tuple[float, float]], float, float]:
+    """Frame layout so boundary members touch the matching face of the super-block.
+
+    bottom band (BOTTOM members + bottom corners, in a row at y=0),
+    top band (TOP members + top corners, at the top),
+    left column (LEFT-only members at x=0) and right column (RIGHT-only members
+    flush to the right) in the middle band, interior (no boundary) shelf-packed in
+    the centre. A member only touches a wall if it sits on that face, so this is
+    what lets the legalizer's edge-placement actually satisfy cluster members.
+    """
+    n = len(widths)
+
+    def has(c, bit):
+        return c & bit
+
+    bottom = [i for i in range(n) if has(codes[i], BOUND_BOTTOM)]
+    top    = [i for i in range(n) if has(codes[i], BOUND_TOP) and not has(codes[i], BOUND_BOTTOM)]
+    used = set(bottom) | set(top)
+    left  = [i for i in range(n) if i not in used and has(codes[i], BOUND_LEFT)]
+    right = [i for i in range(n) if i not in used and has(codes[i], BOUND_RIGHT)
+             and not has(codes[i], BOUND_LEFT)]
+    used |= set(left) | set(right)
+    interior = [i for i in range(n) if i not in used]
+
+    offsets: List[Tuple[float, float]] = [(0.0, 0.0)] * n
+
+    bottom_h = max((heights[i] for i in bottom), default=0.0)
+    top_h    = max((heights[i] for i in top),    default=0.0)
+    left_w   = max((widths[i]  for i in left),   default=0.0)
+    right_w  = max((widths[i]  for i in right),  default=0.0)
+
+    # Interior shelf pack (centre block).
+    if interior:
+        i_w = [widths[i] for i in interior]
+        i_h = [heights[i] for i in interior]
+        i_off, center_w, center_h = _shelf_pack(i_w, i_h)
+    else:
+        i_off, center_w, center_h = [], 0.0, 0.0
+
+    left_h  = sum(heights[i] for i in left)
+    right_h = sum(heights[i] for i in right)
+    middle_h = max(center_h, left_h, right_h, 0.0)
+    middle_w = left_w + center_w + right_w
+    bottom_w = sum(widths[i] for i in bottom)
+    top_w    = sum(widths[i] for i in top)
+    sb_w = max(middle_w, bottom_w, top_w, 1e-6)
+    sb_h = bottom_h + middle_h + top_h
+
+    # Bottom row at y=0, left→right.
+    x = 0.0
+    for i in bottom:
+        offsets[i] = (x, 0.0)
+        x += widths[i]
+    # Top row flush to the top.
+    x = 0.0
+    for i in top:
+        offsets[i] = (x, sb_h - heights[i])
+        x += widths[i]
+    # Left column at x=0, stacked upward in the middle band.
+    y = bottom_h
+    for i in left:
+        offsets[i] = (0.0, y)
+        y += heights[i]
+    # Right column flush right, stacked upward.
+    y = bottom_h
+    for i in right:
+        offsets[i] = (sb_w - widths[i], y)
+        y += heights[i]
+    # Interior in the centre band.
+    for k, i in enumerate(interior):
+        dx, dy = i_off[k]
+        offsets[i] = (left_w + dx, bottom_h + dy)
+
+    return offsets, sb_w, sb_h
 
 
 def _pack_with_anchor(
