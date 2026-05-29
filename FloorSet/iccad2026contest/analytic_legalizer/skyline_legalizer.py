@@ -316,4 +316,81 @@ def skyline_legalize(
         y2 = max(p[1] + p[3] for p in best_pos)
         best_score = x2 * y2
 
+    # Finetune: tuck bbox-defining free blocks into cluster-internal whitespace
+    # to shrink the bbox (grouping unaffected — a non-member in a group's gap does
+    # not change that group's connectivity).
+    best_pos = _finetune_fill_gaps(best_pos, blocks, cluster_groups)
+    x2 = max(p[0] + p[2] for p in best_pos)
+    y2 = max(p[1] + p[3] for p in best_pos)
+    bv = _count_boundary_unmet(best_pos, blocks, x2, y2)
+    best_score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
+
     return best_pos, best_score
+
+
+def _finetune_fill_gaps(positions, blocks, cluster_groups):
+    """Relocate bbox-defining free blocks into cluster-internal gaps when doing so
+    strictly shrinks the bounding box. Conservative: only frontier blocks move, and
+    only if the bbox area decreases (keeps the main packing's positions/HPWL)."""
+    pos = list(positions)
+    n = len(pos)
+    movable = [i for i, b in enumerate(blocks)
+               if not b.is_preplaced and b.cluster_group == 0]
+    clbb = []
+    for mem in cluster_groups.values():
+        xs = min(pos[m][0] for m in mem); ys = min(pos[m][1] for m in mem)
+        xe = max(pos[m][0] + pos[m][2] for m in mem)
+        ye = max(pos[m][1] + pos[m][3] for m in mem)
+        clbb.append((xs, ys, xe, ye))
+    if not clbb:
+        return pos
+
+    def overlaps_any(rx, ry, rw, rh, exclude):
+        for j in range(n):
+            if j == exclude:
+                continue
+            jx, jy, jw, jh = pos[j]
+            if (min(rx + rw, jx + jw) - max(rx, jx) > 1e-6 and
+                    min(ry + rh, jy + jh) - max(ry, jy) > 1e-6):
+                return True
+        return False
+
+    for _ in range(6):
+        x2 = max(p[0] + p[2] for p in pos)
+        y2 = max(p[1] + p[3] for p in pos)
+        area0 = x2 * y2
+        frontier = [i for i in movable
+                    if pos[i][0] + pos[i][2] > x2 - 1e-6 or pos[i][1] + pos[i][3] > y2 - 1e-6]
+        # Largest frontier blocks first (biggest bbox-shrink potential).
+        frontier.sort(key=lambda i: -pos[i][2] * pos[i][3])
+        moved = False
+        for i in frontier:
+            w, h = pos[i][2], pos[i][3]
+            step = max(1.0, min(w, h) * 0.5)
+            for (cx0, cy0, cx1, cy1) in clbb:
+                if cx1 - cx0 < w - 1e-9 or cy1 - cy0 < h - 1e-9:
+                    continue
+                gy = cy0
+                while gy <= cy1 - h + 1e-9:
+                    gx = cx0
+                    while gx <= cx1 - w + 1e-9:
+                        if not overlaps_any(gx, gy, w, h, i):
+                            old = pos[i]
+                            pos[i] = (gx, gy, w, h)
+                            nx2 = max(p[0] + p[2] for p in pos)
+                            ny2 = max(p[1] + p[3] for p in pos)
+                            if nx2 * ny2 < area0 - 1e-6:
+                                moved = True
+                                break
+                            pos[i] = old
+                        gx += step
+                    if moved:
+                        break
+                    gy += step
+                if moved:
+                    break
+            if moved:
+                break
+        if not moved:
+            break
+    return pos
