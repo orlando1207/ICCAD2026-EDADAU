@@ -118,7 +118,7 @@ pip install -r iccad2026contest/requirements.txt
 cd iccad2026contest
 
 # 6. Copy the template optimizer
-cp optimizer_template.py my_optimizer.py
+cp basic_optimizer.py my_optimizer.py
 
 # 7. Implement your algorithm in my_optimizer.py (edit the solve() method)
 
