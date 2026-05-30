@@ -1,4 +1,6 @@
 /baseline
 /codex
-/FloorSet/basic_baseline_output/python_deps/
-/FloorSet/basic_baseline_output/venv/
+/.codex
+/.agents
+/FloorSet/basic_baseline_output/*
+/
