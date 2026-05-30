@@ -12,6 +12,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from .constraints import (
     BlockInfo, SuperBlock,
@@ -262,6 +263,11 @@ def skyline_legalize(
     cy: np.ndarray,
     area_targets,
     lam: float = 0.3,
+    b2b_connectivity=None,
+    p2b_connectivity=None,
+    pins_pos=None,
+    hpwl_weight: float = 0.0,
+    aspect_ladder: Optional[List[float]] = None,
 ) -> Tuple[List[Tuple[float, float, float, float]], float]:
     """Legalize via skyline packing. Tries a ladder of container widths and
     returns (positions, score) for the best (lowest cost-proxy) feasible width."""
@@ -284,7 +290,10 @@ def skyline_legalize(
     else:
         analytic_aspect = 1.0
 
-    aspects = [analytic_aspect, 1.0, 1.3, 1.6, 2.0, 2.5]
+    aspects = list(aspect_ladder) if aspect_ladder is not None else [
+        0.85, 1.0, 1.15, 1.3, 1.45, 1.6, 1.8, 2.0, 2.25, 2.5, 2.8
+    ]
+    aspects.append(analytic_aspect)
     cand_W = set()
     for asp in aspects:
         asp = max(asp, 1e-3)
@@ -303,7 +312,8 @@ def skyline_legalize(
         x2 = max(p[0] + p[2] for p in pos)
         y2 = max(p[1] + p[3] for p in pos)
         bv = _count_boundary_unmet(pos, blocks, x2, y2)
-        score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
+        hpwl = _raw_hpwl(pos, b2b_connectivity, p2b_connectivity, pins_pos)
+        score = _candidate_score(x2 * y2, bv, n, hpwl, hpwl_weight)
         if score < best_score:
             best_score = score
             best_pos = pos
@@ -323,9 +333,59 @@ def skyline_legalize(
     x2 = max(p[0] + p[2] for p in best_pos)
     y2 = max(p[1] + p[3] for p in best_pos)
     bv = _count_boundary_unmet(best_pos, blocks, x2, y2)
-    best_score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
+    hpwl = _raw_hpwl(best_pos, b2b_connectivity, p2b_connectivity, pins_pos)
+    best_score = _candidate_score(x2 * y2, bv, n, hpwl, hpwl_weight)
 
     return best_pos, best_score
+
+
+def _candidate_score(area: float, boundary_unmet: int, n: int,
+                     hpwl: float, hpwl_weight: float) -> float:
+    """Selection proxy for candidate widths.
+
+    The official score uses baseline-relative gaps, which the legalizer does not
+    know.  Raw HPWL is still useful for comparing candidates from the same case.
+    A fractional HPWL exponent keeps area/boundary from being overwhelmed.
+    """
+    boundary_factor = math.exp(2.0 * boundary_unmet / max(n, 1))
+    if hpwl_weight <= 0.0 or hpwl <= 1e-9:
+        return area * boundary_factor
+    return area * boundary_factor * (hpwl ** hpwl_weight)
+
+
+def _raw_hpwl(positions, b2b_connectivity, p2b_connectivity, pins_pos) -> float:
+    hpwl = 0.0
+    if b2b_connectivity is not None:
+        if isinstance(b2b_connectivity, torch.Tensor):
+            b2b_iter = b2b_connectivity.detach().cpu().numpy()
+        else:
+            b2b_iter = b2b_connectivity
+        for edge in b2b_iter:
+            if int(edge[0]) == -1:
+                continue
+            i, j, w = int(edge[0]), int(edge[1]), float(edge[2])
+            if i >= len(positions) or j >= len(positions):
+                continue
+            xi, yi, wi, hi = positions[i]
+            xj, yj, wj, hj = positions[j]
+            hpwl += w * (abs((xi + wi / 2.0) - (xj + wj / 2.0))
+                         + abs((yi + hi / 2.0) - (yj + hj / 2.0)))
+    if p2b_connectivity is not None and pins_pos is not None:
+        if isinstance(p2b_connectivity, torch.Tensor):
+            p2b_iter = p2b_connectivity.detach().cpu().numpy()
+        else:
+            p2b_iter = p2b_connectivity
+        pins = pins_pos.detach().cpu().numpy() if isinstance(pins_pos, torch.Tensor) else pins_pos
+        for edge in p2b_iter:
+            if int(edge[0]) == -1:
+                continue
+            pin, block, w = int(edge[0]), int(edge[1]), float(edge[2])
+            if block >= len(positions) or pin >= len(pins):
+                continue
+            x, y, bw, bh = positions[block]
+            hpwl += w * (abs(float(pins[pin, 0]) - (x + bw / 2.0))
+                         + abs(float(pins[pin, 1]) - (y + bh / 2.0)))
+    return hpwl
 
 
 def _finetune_fill_gaps(positions, blocks, cluster_groups):

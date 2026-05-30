@@ -25,6 +25,9 @@ def analytic_place(
     n_spread_iters: int = 30,
     seed: int = 0,
     noise_std: float = 0.0,
+    wl_model: str = "quadratic",
+    lse_gamma: Optional[float] = None,
+    lse_iters: int = 80,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns (cx, cy): center coordinates for ALL original blocks.
@@ -157,6 +160,15 @@ def analytic_place(
         # No anchors: Laplacian is rank-deficient. Skip linear solve, use grid init.
         cx, cy = _grid_init_xy(num_nodes, node_widths, node_heights, chip_side)
 
+    if wl_model == "lse":
+        cx, cy = _lse_refine(
+            cx, cy, block_to_node, node_widths, node_heights,
+            node_fixed_x, node_fixed_y, b2b_connectivity,
+            p2b_connectivity, pins_pos, chip_side, lse_gamma, lse_iters,
+        )
+    elif wl_model != "quadratic":
+        raise ValueError(f"unsupported wl_model: {wl_model}")
+
     # --- Optional noise injection (for multistart diversity) ---
     if noise_std > 0.0 and seed > 0:
         rng = np.random.default_rng(seed)
@@ -195,6 +207,108 @@ def analytic_place(
             block_cy[i] = cy[ni]
 
     return block_cx, block_cy
+
+
+def _lse_refine(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    block_to_node: Dict[int, int],
+    widths: np.ndarray,
+    heights: np.ndarray,
+    fixed_x: Dict[int, float],
+    fixed_y: Dict[int, float],
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    chip_side: float,
+    gamma: Optional[float],
+    n_iters: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Refine the quadratic solution with smooth L1/LSE wirelength.
+
+    The contest metric is HPWL, not squared wirelength.  For the pairwise nets
+    exposed by FloorSet, a differentiable LSE approximation to |dx| + |dy| has
+    gradient tanh(dx/gamma), tanh(dy/gamma).  Starting from the quadratic solve
+    keeps the global placement stable while this pass reduces the quadratic
+    model's tendency to over-penalize long edges.
+    """
+    cx = cx.copy()
+    cy = cy.copy()
+    n = len(cx)
+    if n == 0 or n_iters <= 0:
+        return cx, cy
+
+    gamma = float(gamma) if gamma is not None else max(chip_side * 0.04, 1.0)
+    gamma = max(gamma, 1e-3)
+
+    b2b_np = None
+    if b2b_connectivity is not None and b2b_connectivity.numel() > 0:
+        b2b_np = b2b_connectivity.numpy() if isinstance(b2b_connectivity, torch.Tensor) else b2b_connectivity
+    p2b_np = None
+    pins_np = None
+    if p2b_connectivity is not None and p2b_connectivity.numel() > 0:
+        p2b_np = p2b_connectivity.numpy() if isinstance(p2b_connectivity, torch.Tensor) else p2b_connectivity
+        pins_np = pins_pos.numpy() if isinstance(pins_pos, torch.Tensor) else pins_pos
+
+    if b2b_np is None and p2b_np is None:
+        return cx, cy
+
+    # Normalize step by incident weight so dense hubs do not jump excessively.
+    incident = np.ones(n, dtype=np.float64) * 1e-6
+    if b2b_np is not None:
+        for edge in b2b_np:
+            bi, bj, w = int(edge[0]), int(edge[1]), float(edge[2])
+            ni, nj = block_to_node[bi], block_to_node[bj]
+            if ni != nj:
+                incident[ni] += w
+                incident[nj] += w
+    if p2b_np is not None:
+        for edge in p2b_np:
+            _, bi, w = int(edge[0]), int(edge[1]), float(edge[2])
+            incident[block_to_node[bi]] += w
+
+    base_step = max(chip_side * 0.018, 0.25)
+    movable = [k for k in range(n) if k not in fixed_x]
+    for it in range(n_iters):
+        gx = np.zeros(n, dtype=np.float64)
+        gy = np.zeros(n, dtype=np.float64)
+
+        if b2b_np is not None:
+            for edge in b2b_np:
+                bi, bj, w = int(edge[0]), int(edge[1]), float(edge[2])
+                ni, nj = block_to_node[bi], block_to_node[bj]
+                if ni == nj:
+                    continue
+                dx = cx[ni] - cx[nj]
+                dy = cy[ni] - cy[nj]
+                tx = w * math.tanh(dx / gamma)
+                ty = w * math.tanh(dy / gamma)
+                gx[ni] += tx
+                gy[ni] += ty
+                gx[nj] -= tx
+                gy[nj] -= ty
+
+        if p2b_np is not None:
+            for edge in p2b_np:
+                pi, bi, w = int(edge[0]), int(edge[1]), float(edge[2])
+                ni = block_to_node[bi]
+                dx = cx[ni] - float(pins_np[pi, 0])
+                dy = cy[ni] - float(pins_np[pi, 1])
+                gx[ni] += w * math.tanh(dx / gamma)
+                gy[ni] += w * math.tanh(dy / gamma)
+
+        step = base_step * (0.96 ** it)
+        for k in movable:
+            cx[k] -= step * gx[k] / incident[k]
+            cy[k] -= step * gy[k] / incident[k]
+            cx[k] = max(widths[k] / 2.0, min(chip_side - widths[k] / 2.0, cx[k]))
+            cy[k] = max(heights[k] / 2.0, min(chip_side - heights[k] / 2.0, cy[k]))
+
+    for nf, x_fixed in fixed_x.items():
+        cx[nf] = x_fixed
+        cy[nf] = fixed_y[nf]
+
+    return cx, cy
 
 
 def _grid_init_xy(
