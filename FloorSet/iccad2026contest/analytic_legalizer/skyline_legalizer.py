@@ -18,6 +18,11 @@ from .constraints import (
     BOUND_LEFT, BOUND_RIGHT, BOUND_TOP, BOUND_BOTTOM,
 )
 
+# Max aspect ratio (h/w or w/h) a soft block may be reshaped to during packing.
+# GT soft blocks span aspect ~0.33–2.9, so 3.0 covers the shapes GT actually uses
+# without producing degenerate slivers.
+AR_MAX = 3.0
+
 
 class Skyline:
     """Top contour of occupied space over [0, W], from y=0 upward.
@@ -84,9 +89,9 @@ class Skyline:
 
 class _Unit:
     """A thing to place: a free block or a rigid cluster box."""
-    __slots__ = ("w", "h", "cx", "cy", "bc", "is_cluster", "key")
+    __slots__ = ("w", "h", "cx", "cy", "bc", "is_cluster", "key", "soft", "area")
 
-    def __init__(self, w, h, cx, cy, bc, is_cluster, key):
+    def __init__(self, w, h, cx, cy, bc, is_cluster, key, soft=False):
         self.w = w
         self.h = h
         self.cx = cx
@@ -94,6 +99,9 @@ class _Unit:
         self.bc = bc
         self.is_cluster = is_cluster
         self.key = key  # block index, or cluster gid
+        # soft == reshapeable: only area is fixed, w/h may change to tessellate.
+        self.soft = soft
+        self.area = w * h
 
 
 def _build_units(
@@ -131,11 +139,57 @@ def _build_units(
         if b.is_preplaced:
             obstacles.append((b.fixed_x, b.fixed_y, b.w, b.h, i))
             continue
+        # Soft (reshapeable) iff only its area is constrained: a fixed-shape block
+        # must keep its dims, and an MIB member must keep the unified group shape.
+        soft = (not b.is_fixed_shape) and b.mib_group == 0
         movable.append(_Unit(
             w=b.w, h=b.h, cx=float(cx[i]), cy=float(cy[i]),
-            bc=b.boundary_code, is_cluster=False, key=("b", i),
+            bc=b.boundary_code, is_cluster=False, key=("b", i), soft=soft,
         ))
     return movable, obstacles
+
+
+def _row_assign_reshape(movable: List[_Unit], W: float) -> None:
+    """Assign interior soft blocks to rows by analytic cy, then reshape each block so
+    its row fills width W exactly (h_ideal = Σarea_in_row / W, area-constant).
+
+    Unlike a global h_row, this per-row height adapts to the actual blocks in each
+    shelf → zero whitespace per row by construction, no AR_MAX breakage from a fixed
+    h_row that doesn't fit extreme-area blocks.  Only singleton rows with a very wide
+    or very tall block can still hit AR_MAX."""
+    interior = [(u.cy, i) for i, u in enumerate(movable) if u.soft and u.bc == 0]
+    if not interior:
+        return
+    interior.sort()
+
+    # Greedy row assignment: accumulate estimated widths (sqrt(area) ≈ square side)
+    # until a row would exceed W, then start a new shelf.
+    rows: List[List[int]] = []
+    cur_row: List[int] = []
+    cur_w = 0.0
+    for _, ui in interior:
+        w_est = math.sqrt(movable[ui].area)
+        if cur_row and cur_w + w_est > W * 1.05:
+            rows.append(cur_row)
+            cur_row = [ui]
+            cur_w = w_est
+        else:
+            cur_row.append(ui)
+            cur_w += w_est
+    if cur_row:
+        rows.append(cur_row)
+
+    for row in rows:
+        total_area = sum(movable[ui].area for ui in row)
+        h_ideal = total_area / W  # fills width W exactly if no AR clamp fires
+        for ui in row:
+            h = h_ideal
+            w = movable[ui].area / h
+            if h / w > AR_MAX:                          # too tall/narrow
+                h = math.sqrt(movable[ui].area * AR_MAX); w = movable[ui].area / h
+            elif w / h > AR_MAX:                        # too wide/short
+                w = math.sqrt(movable[ui].area * AR_MAX); h = movable[ui].area / w
+            movable[ui].w, movable[ui].h = w, h
 
 
 def _pack_one_width(
@@ -203,7 +257,7 @@ def _pack_one_width(
             best_x, best_y = 0.0, _land_y(0.0, u.w, u.h)
 
         sky.raise_to(best_x, best_x + u.w, best_y + u.h)
-        placement[u.key] = (best_x, best_y)
+        placement[u.key] = (best_x, best_y, u.w, u.h)
 
     return placement
 
@@ -266,13 +320,14 @@ def _materialize(
         elif i in cluster_of:
             gid = cluster_of[i]
             sb = super_blocks[gid]
-            X, Y = placement[("c", gid)]
+            X, Y = placement[("c", gid)][:2]
             mi = sb.members.index(i)
             dx, dy = sb.offsets[mi]
             pos[i] = (X + dx, Y + dy, b.w, b.h)
         else:
-            X, Y = placement[("b", i)]
-            pos[i] = (X, Y, b.w, b.h)
+            # free block: use the (possibly reshaped) w/h chosen during packing.
+            X, Y, Wq, Hq = placement[("b", i)]
+            pos[i] = (X, Y, Wq, Hq)
     return pos
 
 
@@ -294,27 +349,10 @@ def skyline_legalize(
     so an area-only proxy mis-picks (chooses too-narrow boxes with worse wirelength)."""
     movable, obstacles = _build_units(blocks, super_blocks, cluster_groups, cx, cy)
 
-    total_area = sum(u.w * u.h for u in movable) + sum(o[2] * o[3] for o in obstacles)
-    max_unit_w = max((u.w for u in movable), default=1.0)
+    total_area = sum(u.area for u in movable) + sum(o[2] * o[3] for o in obstacles)
     max_pre_r = max((o[0] + o[2] for o in obstacles), default=0.0)
-    W_min = max(max_unit_w, max_pre_r, 1e-6)
 
-    # Analytic-bbox aspect as a hint.
-    if movable:
-        ax_min = min(u.cx - u.w / 2.0 for u in movable)
-        ax_max = max(u.cx + u.w / 2.0 for u in movable)
-        ay_min = min(u.cy - u.h / 2.0 for u in movable)
-        ay_max = max(u.cy + u.h / 2.0 for u in movable)
-        aw = max(ax_max - ax_min, 1e-6)
-        ah = max(ay_max - ay_min, 1e-6)
-        analytic_aspect = ah / aw  # height/width
-    else:
-        analytic_aspect = 1.0
-
-    # Boundary-derived aspect prior: a LEFT/RIGHT block must sit on a vertical wall
-    # (needs height), a TOP/BOTTOM block on a horizontal wall (needs width), so the
-    # intended outline aspect H/W ≈ Σheight(LR) / Σwidth(TB). This correlates ~0.9
-    # with the GT aspect — a strong physics-based prior the area·HPWL proxy lacks.
+    # Boundary-derived aspect prior.
     sh_lr, sw_tb = 1e-6, 1e-6
     for b in blocks:
         bc = b.boundary_code
@@ -323,41 +361,106 @@ def skyline_legalize(
         if bc & BOUND_TOP or bc & BOUND_BOTTOM:
             sw_tb += b.w
     asp_pred = min(max(sh_lr / sw_tb, 0.3), 3.2)
-    PRIOR = 0.5  # mild: prediction is informative but noisy — nudge, don't dictate
+    PRIOR = 0.5
 
-    # aspect = height/width: <1 = wide/short, >1 = tall/narrow. Include both so a
-    # wide container can win when the instance prefers it (the score proxy selects).
+    # Analytic bbox aspect (from initial square shapes; used to seed width ladder).
+    if movable:
+        ax_min = min(u.cx - u.w / 2.0 for u in movable)
+        ax_max = max(u.cx + u.w / 2.0 for u in movable)
+        ay_min = min(u.cy - u.h / 2.0 for u in movable)
+        ay_max = max(u.cy + u.h / 2.0 for u in movable)
+        analytic_aspect = max(ay_max - ay_min, 1e-6) / max(ax_max - ax_min, 1e-6)
+    else:
+        analytic_aspect = 1.0
+
+    # Width ladder (aspect-derived), computed once from total_area.
     aspects = [analytic_aspect, asp_pred, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
-    cand_W = set()
+    sq_side = math.sqrt(sum(u.area for u in movable if u.soft and u.bc == 0) or total_area)
+    W_min_sq = max(sq_side, max_pre_r, 1e-6)  # safe lower bound for square shapes
+    cand_W_base: List[float] = []
     for asp in aspects:
-        asp = max(asp, 1e-3)
-        w = math.sqrt(total_area / asp)
-        cand_W.add(round(max(w, W_min), 3))
-    cand_W.add(round(W_min, 3))
+        cand_W_base.append(round(max(math.sqrt(total_area / max(asp, 1e-3)), W_min_sq), 3))
+    cand_W_base.append(round(W_min_sq, 3))
+    cand_W_base = sorted(set(cand_W_base))
 
     n = len(blocks)
     best_pos = None
     best_score = float("inf")
-    for W in sorted(cand_W):
-        placement = _pack_one_width(movable, obstacles, W, lam)
-        if placement is None:
-            continue
-        pos = _materialize(placement, blocks, super_blocks, cluster_groups)
+
+    def _restore_squares():
+        for u in movable:
+            if u.soft and u.bc == 0:
+                s = math.sqrt(u.area); u.w = u.h = s
+
+    def _pack_and_score(pos_cache: dict, W: float) -> Tuple[Optional[List], float, float]:
+        """Pack at W (using cached pos if available), return (pos, area_proxy, hpwl).
+        Caches pos in pos_cache[W] to avoid repacking for the same W."""
+        if W not in pos_cache:
+            if any(u.w > W + 1e-6 for u in movable):
+                pos_cache[W] = None
+            else:
+                pl = _pack_one_width(movable, obstacles, W, lam)
+                pos_cache[W] = None if pl is None else _materialize(pl, blocks, super_blocks, cluster_groups)
+        pos = pos_cache[W]
+        if pos is None:
+            return None, float('inf'), 0.0
         x2 = max(p[0] + p[2] for p in pos)
         y2 = max(p[1] + p[3] for p in pos)
         bv = _count_boundary_unmet(pos, blocks, x2, y2)
-        hp = _raw_hpwl(pos, b2b, p2b, pins)
-        score = (x2 * y2) * (hp if hp > 1e-9 else 1.0) * math.exp(2.0 * bv / max(n, 1))
-        # Soft prior toward the boundary-predicted aspect.
         cand_aspect = y2 / max(x2, 1e-6)
-        score *= 1.0 + PRIOR * abs(math.log(cand_aspect / asp_pred))
+        area_s = (x2 * y2) * math.exp(2.0 * bv / max(n, 1)) * (
+            1.0 + PRIOR * abs(math.log(cand_aspect / asp_pred)))
+        return pos, area_s, 0.0
+
+    # Full proxy = area·HPWL·exp·prior. Factor it: rank by cheap area proxy first,
+    # then compute HPWL only for the top-2 per shape mode.
+    # Pass 1: square shapes — pack all W candidates, rank by cheap area proxy,
+    # then compute HPWL only for the top-2 (the expensive call).
+    _restore_squares()
+    cache1: dict = {}
+    sq_area: List[Tuple[float, float, object]] = []
+    for W in cand_W_base:
+        pos, a_s, _ = _pack_and_score(cache1, W)
+        sq_area.append((W, a_s, pos))
+
+    for W, a_s, pos in sorted(sq_area, key=lambda t: t[1])[:2]:
+        if pos is None:
+            continue
+        hp = _raw_hpwl(pos, b2b, p2b, pins)
+        score = a_s * (hp if hp > 1e-9 else 1.0)
         if score < best_score:
-            best_score = score
-            best_pos = pos
+            best_score = score; best_pos = pos
+
+    # Pass 2: row-assigned shapes. Restrict to top-4 W by square-area score
+    # (row-assign favours similar widths → no need to sweep all 11). For each
+    # selected W, reshape so every shelf fills width W exactly → tight packing.
+    top_Ws = [W for W, _, _ in sorted(sq_area, key=lambda t: t[1])[:4]]
+    ra_area: List[Tuple[float, float, object]] = []
+    for W in top_Ws:
+        _row_assign_reshape(movable, W)
+        pl = _pack_one_width(movable, obstacles, W, lam)
+        if pl is None:
+            continue
+        pos = _materialize(pl, blocks, super_blocks, cluster_groups)
+        x2 = max(p[0] + p[2] for p in pos); y2 = max(p[1] + p[3] for p in pos)
+        bv = _count_boundary_unmet(pos, blocks, x2, y2)
+        cand_asp = y2 / max(x2, 1e-6)
+        a_s = (x2 * y2) * math.exp(2.0 * bv / max(n, 1)) * (
+            1.0 + PRIOR * abs(math.log(cand_asp / asp_pred)))
+        ra_area.append((W, a_s, pos))
+
+    for W, a_s, pos in sorted(ra_area, key=lambda t: t[1])[:2]:
+        hp = _raw_hpwl(pos, b2b, p2b, pins)
+        score = a_s * (hp if hp > 1e-9 else 1.0)
+        if score < best_score:
+            best_score = score; best_pos = pos
+
+    # Restore squares after loop so fallback below always works.
+    _restore_squares()
 
     if best_pos is None:
-        # Fallback: pack at W_min (always feasible width-wise).
-        placement = _pack_one_width(movable, obstacles, W_min, lam)
+        # Fallback: pack at W_min_sq (always feasible for square shapes).
+        placement = _pack_one_width(movable, obstacles, W_min_sq, lam)
         best_pos = _materialize(placement, blocks, super_blocks, cluster_groups)
         x2 = max(p[0] + p[2] for p in best_pos)
         y2 = max(p[1] + p[3] for p in best_pos)
