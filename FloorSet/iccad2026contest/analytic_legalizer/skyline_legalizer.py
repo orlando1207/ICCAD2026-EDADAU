@@ -85,9 +85,13 @@ class Skyline:
 
 class _Unit:
     """A thing to place: a free block or a rigid cluster box."""
-    __slots__ = ("w", "h", "cx", "cy", "bc", "is_cluster", "key")
+    __slots__ = (
+        "w", "h", "cx", "cy", "bc", "is_cluster", "key",
+        "members", "center_offsets", "net_weight",
+    )
 
-    def __init__(self, w, h, cx, cy, bc, is_cluster, key):
+    def __init__(self, w, h, cx, cy, bc, is_cluster, key,
+                 members, center_offsets):
         self.w = w
         self.h = h
         self.cx = cx
@@ -95,6 +99,9 @@ class _Unit:
         self.bc = bc
         self.is_cluster = is_cluster
         self.key = key  # block index, or cluster gid
+        self.members = members
+        self.center_offsets = center_offsets
+        self.net_weight = 0.0
 
 
 def _build_units(
@@ -124,6 +131,11 @@ def _build_units(
             w=sb.w, h=sb.h,
             cx=sb_ll_x + sb.w / 2.0, cy=sb_ll_y + sb.h / 2.0,
             bc=sb.boundary_code, is_cluster=True, key=("c", gid),
+            members=list(members),
+            center_offsets=[
+                (dx + blocks[m].w / 2.0, dy + blocks[m].h / 2.0)
+                for m, (dx, dy) in zip(sb.members, sb.offsets)
+            ],
         ))
 
     for i, b in enumerate(blocks):
@@ -135,6 +147,8 @@ def _build_units(
         movable.append(_Unit(
             w=b.w, h=b.h, cx=float(cx[i]), cy=float(cy[i]),
             bc=b.boundary_code, is_cluster=False, key=("b", i),
+            members=[i],
+            center_offsets=[(b.w / 2.0, b.h / 2.0)],
         ))
     return movable, obstacles
 
@@ -144,6 +158,9 @@ def _pack_one_width(
     obstacles: List[Tuple[float, float, float, float, int]],
     W: float,
     lam: float,
+    order_mode: str = "analytic",
+    net_weight: float = 0.0,
+    net_ctx: Optional[Dict] = None,
 ) -> Optional[Dict]:
     """One deterministic packing pass at width W. Returns a placement dict
     {unit_key: (x, y)} for movable units, or None if infeasible at this W."""
@@ -172,13 +189,21 @@ def _pack_one_width(
         return y
 
     # Placement order: BOTTOM-forced first (so they reach y=0 while empty),
-    # then by analytic (cy, cx); TOP-forced last (best-effort top).
+    # TOP-forced last (best-effort top), then a deterministic mode-specific
+    # priority.  Trying a few orders is cheap and reduces greedy failures.
     def order_key(u: _Unit):
         bottom = 1 if (u.bc & BOUND_BOTTOM) else 0
         top = 1 if (u.bc & BOUND_TOP) else 0
+        if order_mode == "area":
+            return (-bottom, top, -u.w * u.h, u.cy, u.cx)
+        if order_mode == "net":
+            return (-bottom, top, -u.net_weight, u.cy, u.cx)
+        if order_mode == "cluster":
+            return (-bottom, top, 0 if u.is_cluster else 1, u.cy, u.cx)
         return (-bottom, top, u.cy, u.cx)
 
     placement: Dict = {}
+    placed_centers: Dict[int, Tuple[float, float]] = {}
     for u in sorted(movable, key=order_key):
         if u.bc & BOUND_LEFT:
             cands = [0.0]
@@ -196,6 +221,9 @@ def _pack_one_width(
                 x = 0.0
             y = _land_y(x, u.w, u.h)
             score = y + lam * abs((x + u.w / 2.0) - u.cx)
+            if net_weight > 0.0 and net_ctx is not None:
+                score += net_weight * _incremental_net_cost(
+                    u, x, y, placed_centers, net_ctx)
             if score < best_score - 1e-9:
                 best_score = score
                 best_x = x
@@ -205,8 +233,97 @@ def _pack_one_width(
 
         sky.raise_to(best_x, best_x + u.w, best_y + u.h)
         placement[u.key] = (best_x, best_y)
+        for m, (ox, oy) in zip(u.members, u.center_offsets):
+            placed_centers[m] = (best_x + ox, best_y + oy)
 
     return placement
+
+
+def _build_net_context(block_count, cx, cy, b2b_connectivity, p2b_connectivity,
+                       pins_pos) -> Dict:
+    adj = [[] for _ in range(block_count)]
+    pin_adj = [[] for _ in range(block_count)]
+    incident = np.ones(block_count, dtype=np.float64) * 1e-6
+
+    if b2b_connectivity is not None:
+        b2b_iter = (b2b_connectivity.detach().cpu().numpy()
+                    if isinstance(b2b_connectivity, torch.Tensor)
+                    else b2b_connectivity)
+        for edge in b2b_iter:
+            if int(edge[0]) == -1:
+                continue
+            i, j, w = int(edge[0]), int(edge[1]), float(edge[2])
+            if i >= block_count or j >= block_count:
+                continue
+            adj[i].append((j, w))
+            adj[j].append((i, w))
+            incident[i] += w
+            incident[j] += w
+
+    pins = None
+    if pins_pos is not None:
+        pins = pins_pos.detach().cpu().numpy() if isinstance(pins_pos, torch.Tensor) else pins_pos
+
+    if p2b_connectivity is not None and pins is not None:
+        p2b_iter = (p2b_connectivity.detach().cpu().numpy()
+                    if isinstance(p2b_connectivity, torch.Tensor)
+                    else p2b_connectivity)
+        for edge in p2b_iter:
+            if int(edge[0]) == -1:
+                continue
+            pin, block, w = int(edge[0]), int(edge[1]), float(edge[2])
+            if block >= block_count or pin >= len(pins):
+                continue
+            pin_adj[block].append((float(pins[pin, 0]), float(pins[pin, 1]), w))
+            incident[block] += w
+
+    return {
+        "adj": adj,
+        "pin_adj": pin_adj,
+        "incident": incident,
+        "analytic": [(float(cx[i]), float(cy[i])) for i in range(block_count)],
+    }
+
+
+def _incremental_net_cost(unit: _Unit, x: float, y: float, placed_centers: Dict,
+                          net_ctx: Dict) -> float:
+    """Average estimated net distance for placing this unit at (x, y).
+
+    Already placed neighbors use final centers. Unplaced neighbors use analytic
+    centers, so the term is available during one-pass skyline placement.
+    """
+    adj = net_ctx["adj"]
+    pin_adj = net_ctx["pin_adj"]
+    analytic = net_ctx["analytic"]
+    incident = net_ctx["incident"]
+
+    total = 0.0
+    weight = 0.0
+    candidate_centers = {}
+    for m, (ox, oy) in zip(unit.members, unit.center_offsets):
+        candidate_centers[m] = (x + ox, y + oy)
+
+    member_set = set(unit.members)
+    for m, (mx, my) in candidate_centers.items():
+        for nb, w in adj[m]:
+            if nb in member_set:
+                continue
+            nx, ny = placed_centers.get(nb, analytic[nb])
+            total += w * (abs(mx - nx) + abs(my - ny))
+            weight += w
+        for px, py, w in pin_adj[m]:
+            total += w * (abs(mx - px) + abs(my - py))
+            weight += w
+
+    return total / max(weight, 1e-6)
+
+
+def _assign_unit_net_weights(units: List[_Unit], net_ctx: Optional[Dict]) -> None:
+    if net_ctx is None:
+        return
+    incident = net_ctx["incident"]
+    for u in units:
+        u.net_weight = float(sum(incident[m] for m in u.members))
 
 
 def _count_boundary_unmet(positions, blocks, x2, y2, tol=1.0) -> int:
@@ -268,10 +385,19 @@ def skyline_legalize(
     pins_pos=None,
     hpwl_weight: float = 0.0,
     aspect_ladder: Optional[List[float]] = None,
+    net_weight: float = 0.0,
+    order_modes: Optional[List[str]] = None,
+    refine_widths: bool = False,
 ) -> Tuple[List[Tuple[float, float, float, float]], float]:
     """Legalize via skyline packing. Tries a ladder of container widths and
     returns (positions, score) for the best (lowest cost-proxy) feasible width."""
     movable, obstacles = _build_units(blocks, super_blocks, cluster_groups, cx, cy)
+    order_modes = order_modes or ["analytic"]
+    net_ctx = None
+    if net_weight > 0.0 or any(m in ("net",) for m in order_modes):
+        net_ctx = _build_net_context(
+            len(blocks), cx, cy, b2b_connectivity, p2b_connectivity, pins_pos)
+        _assign_unit_net_weights(movable, net_ctx)
 
     total_area = sum(u.w * u.h for u in movable) + sum(o[2] * o[3] for o in obstacles)
     max_unit_w = max((u.w for u in movable), default=1.0)
@@ -300,27 +426,43 @@ def skyline_legalize(
         w = math.sqrt(total_area / asp)
         cand_W.add(round(max(w, W_min), 3))
     cand_W.add(round(W_min, 3))
+    if refine_widths:
+        base = list(cand_W)
+        for W in base:
+            for mul in (0.94, 0.97, 1.03, 1.06):
+                cand_W.add(round(max(W * mul, W_min), 3))
 
     n = len(blocks)
     best_pos = None
     best_score = float("inf")
     for W in sorted(cand_W):
-        placement = _pack_one_width(movable, obstacles, W, lam)
-        if placement is None:
-            continue
-        pos = _materialize(placement, blocks, super_blocks, cluster_groups)
-        x2 = max(p[0] + p[2] for p in pos)
-        y2 = max(p[1] + p[3] for p in pos)
-        bv = _count_boundary_unmet(pos, blocks, x2, y2)
-        hpwl = _raw_hpwl(pos, b2b_connectivity, p2b_connectivity, pins_pos)
-        score = _candidate_score(x2 * y2, bv, n, hpwl, hpwl_weight)
-        if score < best_score:
-            best_score = score
-            best_pos = pos
+        for order_mode in order_modes:
+            placement = _pack_one_width(
+                movable, obstacles, W, lam,
+                order_mode=order_mode,
+                net_weight=net_weight,
+                net_ctx=net_ctx,
+            )
+            if placement is None:
+                continue
+            pos = _materialize(placement, blocks, super_blocks, cluster_groups)
+            x2 = max(p[0] + p[2] for p in pos)
+            y2 = max(p[1] + p[3] for p in pos)
+            bv = _count_boundary_unmet(pos, blocks, x2, y2)
+            hpwl = _raw_hpwl(pos, b2b_connectivity, p2b_connectivity, pins_pos)
+            score = _candidate_score(x2 * y2, bv, n, hpwl, hpwl_weight)
+            if score < best_score:
+                best_score = score
+                best_pos = pos
 
     if best_pos is None:
         # Fallback: pack at W_min (always feasible width-wise).
-        placement = _pack_one_width(movable, obstacles, W_min, lam)
+        placement = _pack_one_width(
+            movable, obstacles, W_min, lam,
+            order_mode=order_modes[0],
+            net_weight=net_weight,
+            net_ctx=net_ctx,
+        )
         best_pos = _materialize(placement, blocks, super_blocks, cluster_groups)
         x2 = max(p[0] + p[2] for p in best_pos)
         y2 = max(p[1] + p[3] for p in best_pos)

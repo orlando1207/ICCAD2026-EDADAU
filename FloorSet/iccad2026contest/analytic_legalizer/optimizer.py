@@ -70,11 +70,23 @@ class MyOptimizer(FloorplanOptimizer):
         N_STARTS  = 1      # single deterministic seed (no noise); fast baseline.
         NOISE_STD = 0.12   # used only if N_STARTS > 1 (raise for multistart)
         WL_MODELS = ("quadratic", "lse") if block_count >= 116 else ("quadratic",)
-        SKYLINE_CONFIGS = (
-            # (lambda, width-selection HPWL exponent)
-            (0.20, 0.00),
-            (0.45, 0.00),
-        )
+        if block_count >= 116:
+            SKYLINE_CONFIGS = (
+                # (lambda, width-selection HPWL exponent, net weight, orders, width refine)
+                (0.20, 0.00, 0.00, ("analytic",), False),
+                (0.45, 0.00, 0.00, ("analytic",), False),
+                (0.30, 0.00, 0.18, ("analytic",), False),
+                (0.30, 0.00, 0.00, ("analytic", "net"), False),
+                (0.30, 0.00, 0.12, ("analytic", "net"), False),
+                (0.20, 0.00, 0.12, ("analytic",), False),
+                (0.45, 0.00, 0.08, ("cluster",), False),
+                (0.30, 0.00, 0.35, ("cluster",), False),
+            )
+        else:
+            SKYLINE_CONFIGS = (
+                (0.20, 0.00, 0.00, ("analytic",), False),
+                (0.45, 0.00, 0.00, ("analytic",), False),
+            )
 
         best_positions = None
         best_proxy = float('inf')
@@ -89,7 +101,7 @@ class MyOptimizer(FloorplanOptimizer):
                     seed=seed, noise_std=(NOISE_STD if seed > 0 else 0.0),
                     wl_model=wl_model,
                 )
-                for lam, hpwl_weight in SKYLINE_CONFIGS:
+                for lam, hpwl_weight, net_weight, order_modes, refine_widths in SKYLINE_CONFIGS:
                     _pos, _ = skyline_legalize(
                         blocks, super_blocks, cluster_groups, _cx, _cy, area_targets,
                         lam=lam,
@@ -97,9 +109,14 @@ class MyOptimizer(FloorplanOptimizer):
                         p2b_connectivity=p2b_connectivity,
                         pins_pos=pins_pos,
                         hpwl_weight=hpwl_weight,
+                        net_weight=net_weight,
+                        order_modes=list(order_modes),
+                        refine_widths=refine_widths,
                     )
                     _pos = slide_boundary(_pos, blocks, super_blocks, cluster_groups)
                     _pos = enforce_hard(_pos, blocks, area_targets)
+                    _pos = _local_slide_refine(
+                        _pos, constraints, b2b_connectivity, p2b_connectivity, pins_pos)
 
                     _x2 = max(p[0] + p[2] for p in _pos)
                     _y2 = max(p[1] + p[3] for p in _pos)
@@ -191,3 +208,114 @@ def _soft_violation_proxy(
         soft += max(0, comps - 1)
 
     return soft
+
+
+def _local_slide_refine(
+    positions: List[Tuple[float, float, float, float]],
+    constraints: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+) -> List[Tuple[float, float, float, float]]:
+    """Conservative post-legalization compaction for free blocks.
+
+    Only unconstrained, non-cluster blocks are considered, and only left/down
+    slides are tested.  A move is accepted if the same final selector proxy
+    improves and no overlap is introduced.  This targets residual right/top
+    frontier whitespace without touching hard-constrained blocks.
+    """
+    pos = list(positions)
+    n = len(pos)
+    if n == 0 or constraints is None or len(constraints) < n:
+        return pos
+
+    def hpwl(cur):
+        return (calculate_hpwl_b2b(cur, b2b_connectivity)
+                + calculate_hpwl_p2b(cur, p2b_connectivity, pins_pos))
+
+    def proxy(cur):
+        x2 = max(p[0] + p[2] for p in cur)
+        y2 = max(p[1] + p[3] for p in cur)
+        h = hpwl(cur)
+        s = _soft_violation_proxy(cur, constraints)
+        return (x2 * y2) * (h if h > 1e-9 else 1.0) * np.exp(3.0 * s / max(n, 1))
+
+    def overlaps_any(i, x, y):
+        _, _, w, h = pos[i]
+        for j, (jx, jy, jw, jh) in enumerate(pos):
+            if i == j:
+                continue
+            if (min(x + w, jx + jw) - max(x, jx) > 1e-6 and
+                    min(y + h, jy + jh) - max(y, jy) > 1e-6):
+                return True
+        return False
+
+    movable = []
+    for i in range(n):
+        c = constraints[i]
+        is_fixed = bool(c[0].item() > 0)
+        is_preplaced = bool(c[1].item() > 0)
+        in_cluster = int(c[3].item()) > 0
+        has_boundary = int(c[4].item()) > 0
+        if not (is_fixed or is_preplaced or in_cluster or has_boundary):
+            movable.append(i)
+
+    best_proxy = proxy(pos)
+    for _ in range(3):
+        x2 = max(p[0] + p[2] for p in pos)
+        y2 = max(p[1] + p[3] for p in pos)
+        frontier = [
+            i for i in movable
+            if pos[i][0] + pos[i][2] > x2 - 1e-6
+            or pos[i][1] + pos[i][3] > y2 - 1e-6
+        ]
+        frontier.sort(key=lambda i: -pos[i][2] * pos[i][3])
+        moved = False
+
+        for i in frontier:
+            x, y, w, h = pos[i]
+            candidates = []
+
+            # Slide left until blocked by an overlapping vertical span.
+            new_x = 0.0
+            for j, (jx, jy, jw, jh) in enumerate(pos):
+                if i == j:
+                    continue
+                y_ov = min(y + h, jy + jh) - max(y, jy)
+                if y_ov > 1e-6 and jx + jw <= x + 1e-6:
+                    new_x = max(new_x, jx + jw)
+            if new_x < x - 1e-6:
+                candidates.append((new_x, y))
+
+            # Slide down until blocked by an overlapping horizontal span.
+            new_y = 0.0
+            for j, (jx, jy, jw, jh) in enumerate(pos):
+                if i == j:
+                    continue
+                x_ov = min(x + w, jx + jw) - max(x, jx)
+                if x_ov > 1e-6 and jy + jh <= y + 1e-6:
+                    new_y = max(new_y, jy + jh)
+            if new_y < y - 1e-6:
+                candidates.append((x, new_y))
+
+            if new_x < x - 1e-6 and new_y < y - 1e-6:
+                candidates.append((new_x, new_y))
+
+            for nx, ny in candidates:
+                if overlaps_any(i, nx, ny):
+                    continue
+                old = pos[i]
+                pos[i] = (nx, ny, w, h)
+                cand_proxy = proxy(pos)
+                if cand_proxy < best_proxy - 1e-6:
+                    best_proxy = cand_proxy
+                    moved = True
+                    break
+                pos[i] = old
+            if moved:
+                break
+
+        if not moved:
+            break
+
+    return pos
