@@ -166,6 +166,12 @@ def analytic_place(
             node_fixed_x, node_fixed_y, b2b_connectivity,
             p2b_connectivity, pins_pos, chip_side, lse_gamma, lse_iters,
         )
+    elif wl_model == "irls":
+        cx, cy = _irls_refine(
+            cx, cy, block_to_node, node_widths, node_heights,
+            node_fixed_x, node_fixed_y, b2b_connectivity,
+            p2b_connectivity, pins_pos, chip_side,
+        )
     elif wl_model != "quadratic":
         raise ValueError(f"unsupported wl_model: {wl_model}")
 
@@ -207,6 +213,128 @@ def analytic_place(
             block_cy[i] = cy[ni]
 
     return block_cx, block_cy
+
+
+def _irls_refine(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    block_to_node: Dict[int, int],
+    widths: np.ndarray,
+    heights: np.ndarray,
+    fixed_x: Dict[int, float],
+    fixed_y: Dict[int, float],
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    chip_side: float,
+    n_iters: int = 8,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Refine the quadratic solution toward the *true* L1 wirelength optimum.
+
+    The contest cost uses edge-based Manhattan wirelength,
+    ``Σ_e w_e·(|Δx| + |Δy|)`` between block centers (and pin→center terms), which
+    is separable per axis.  Each axis is an L1 minimization; we solve it by
+    iteratively-reweighted least squares (IRLS): the |d| term is approximated by
+    ``d² / |d_prev|`` so every iteration is a weighted-Laplacian *least-squares*
+    solve with edge weight ``w_e / max(|d_prev|, eps)`` — reusing the same dense
+    solver as the quadratic build.  A few iterations converge to the L1 minimizer.
+
+    Unlike the tanh-LSE refine, this is parameter-free (no step/gamma tuning) and
+    minimizes exactly the metric the scorer measures.  A tiny proximal term keeps
+    every system non-singular (handles the translation-invariant, anchor-free case)
+    and damps oscillation between iterations.
+    """
+    cx = cx.copy()
+    cy = cy.copy()
+    n = len(cx)
+    if n == 0 or n_iters <= 0:
+        return cx, cy
+
+    # Build node-indexed edge lists once.
+    edges: List[Tuple[int, int, float]] = []
+    if b2b_connectivity is not None and b2b_connectivity.numel() > 0:
+        b2b_np = (b2b_connectivity.detach().cpu().numpy()
+                  if isinstance(b2b_connectivity, torch.Tensor) else b2b_connectivity)
+        for e in b2b_np:
+            if int(e[0]) == -1:
+                continue
+            ni, nj = block_to_node[int(e[0])], block_to_node[int(e[1])]
+            if ni != nj:
+                edges.append((ni, nj, float(e[2])))
+
+    pin_edges: List[Tuple[int, float, float, float]] = []
+    if p2b_connectivity is not None and p2b_connectivity.numel() > 0 and pins_pos is not None:
+        p2b_np = (p2b_connectivity.detach().cpu().numpy()
+                  if isinstance(p2b_connectivity, torch.Tensor) else p2b_connectivity)
+        pins_np = pins_pos.detach().cpu().numpy() if isinstance(pins_pos, torch.Tensor) else pins_pos
+        for e in p2b_np:
+            if int(e[0]) == -1:
+                continue
+            ni = block_to_node[int(e[1])]
+            pin_edges.append((ni, float(pins_np[int(e[0]), 0]),
+                              float(pins_np[int(e[0]), 1]), float(e[2])))
+
+    if not edges and not pin_edges:
+        return cx, cy
+
+    eps = max(chip_side * 1e-3, 1e-6)
+    # Proximal weight: small vs. a typical incident edge weight so it only
+    # regularizes (keeps systems non-singular, damps oscillation).
+    avg_w = (sum(w for _, _, w in edges) + sum(w for *_, w in pin_edges)) \
+        / max(len(edges) + len(pin_edges), 1)
+    mu = 1e-3 * avg_w / max(eps, 1e-9)
+
+    movable = [k for k in range(n) if k not in fixed_x]
+
+    for _ in range(n_iters):
+        Ax = np.zeros((n, n), dtype=np.float64)
+        Ay = np.zeros((n, n), dtype=np.float64)
+        bx = np.zeros(n, dtype=np.float64)
+        by = np.zeros(n, dtype=np.float64)
+
+        for ni, nj, w in edges:
+            wx = w / max(abs(cx[ni] - cx[nj]), eps)
+            wy = w / max(abs(cy[ni] - cy[nj]), eps)
+            Ax[ni, ni] += wx; Ax[nj, nj] += wx; Ax[ni, nj] -= wx; Ax[nj, ni] -= wx
+            Ay[ni, ni] += wy; Ay[nj, nj] += wy; Ay[ni, nj] -= wy; Ay[nj, ni] -= wy
+        for ni, px, py, w in pin_edges:
+            wx = w / max(abs(cx[ni] - px), eps)
+            wy = w / max(abs(cy[ni] - py), eps)
+            Ax[ni, ni] += wx; bx[ni] += wx * px
+            Ay[ni, ni] += wy; by[ni] += wy * py
+
+        # Proximal term toward the current point (also fixes translation DOF).
+        for k in range(n):
+            Ax[k, k] += mu; bx[k] += mu * cx[k]
+            Ay[k, k] += mu; by[k] += mu * cy[k]
+
+        # Dirichlet rows for preplaced (fixed) nodes, per axis.
+        for nf in fixed_x:
+            xf, yf = fixed_x[nf], fixed_y[nf]
+            for k in range(n):
+                if k != nf:
+                    bx[k] -= Ax[k, nf] * xf
+                    by[k] -= Ay[k, nf] * yf
+                    Ax[k, nf] = 0.0; Ax[nf, k] = 0.0
+                    Ay[k, nf] = 0.0; Ay[nf, k] = 0.0
+            Ax[nf, nf] = 1.0; bx[nf] = xf
+            Ay[nf, nf] = 1.0; by[nf] = yf
+
+        try:
+            nx = np.linalg.solve(Ax, bx)
+            ny = np.linalg.solve(Ay, by)
+        except np.linalg.LinAlgError:
+            break
+
+        for k in movable:
+            cx[k] = max(widths[k] / 2.0, min(chip_side - widths[k] / 2.0, nx[k]))
+            cy[k] = max(heights[k] / 2.0, min(chip_side - heights[k] / 2.0, ny[k]))
+
+    for nf in fixed_x:
+        cx[nf] = fixed_x[nf]
+        cy[nf] = fixed_y[nf]
+
+    return cx, cy
 
 
 def _lse_refine(

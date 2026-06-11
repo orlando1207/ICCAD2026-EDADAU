@@ -73,7 +73,11 @@ class MyOptimizer(FloorplanOptimizer):
         # are ~28% of the grade (and are empirically the worst-scoring ones).
         # They are also cheap to legalize, so run the full search at every size.
         RICH_SEARCH = block_count >= 1
-        WL_MODELS = ("quadratic", "lse") if RICH_SEARCH else ("quadratic",)
+        # "irls" minimizes the contest's true edge-based L1 wirelength exactly
+        # (iteratively-reweighted least squares); "lse" is the older smooth-L1
+        # approximation. Both are kept as candidate generators — selection by the
+        # area·HPWL proxy picks the best legalized result per case.
+        WL_MODELS = ("quadratic", "lse", "irls") if RICH_SEARCH else ("quadratic",)
         if RICH_SEARCH:
             SKYLINE_CONFIGS = (
                 # (lambda, width-selection HPWL exponent, net weight, orders, width refine)
