@@ -69,8 +69,12 @@ class MyOptimizer(FloorplanOptimizer):
         # ------------------------------------------------------------------
         N_STARTS  = 1      # single deterministic seed (no noise); fast baseline.
         NOISE_STD = 0.12   # used only if N_STARTS > 1 (raise for multistart)
-        WL_MODELS = ("quadratic", "lse") if block_count >= 116 else ("quadratic",)
-        if block_count >= 116:
+        # The official scorer now weights cases by e^(n/12), so sub-116 cases
+        # are ~28% of the grade (and are empirically the worst-scoring ones).
+        # They are also cheap to legalize, so run the full search at every size.
+        RICH_SEARCH = block_count >= 1
+        WL_MODELS = ("quadratic", "lse") if RICH_SEARCH else ("quadratic",)
+        if RICH_SEARCH:
             SKYLINE_CONFIGS = (
                 # (lambda, width-selection HPWL exponent, net weight, orders, width refine)
                 (0.20, 0.00, 0.00, ("analytic",), False),
