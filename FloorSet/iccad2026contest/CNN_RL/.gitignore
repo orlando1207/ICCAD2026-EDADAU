@@ -2,3 +2,4 @@ VERSION_B_RL_PLACER.md
 HANDOFF.md
 __pycache__/
 checkpoints/
+*.png

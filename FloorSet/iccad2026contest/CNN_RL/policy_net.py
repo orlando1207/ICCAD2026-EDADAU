@@ -10,8 +10,18 @@ Combines the two encoders into the actor-critic head:
     into a distribution over the G*G lower-left placement cells.
   * Value head -> scalar V(s) for the PPO baseline (Phase 4).
 
-Single-sample (one problem at a time), matching PlacementEnv. A batch dim is
-added/removed internally so the convs work.
+Trunk (Phase 10 redesign): keeps full G x G resolution (no down/up-sampling),
+but widens the receptive field two ways so each cell sees global structure:
+  * a stack of **dilated** 3x3 convs (dilation 1,2,4,8,...) -> receptive field
+    grows exponentially to cover the whole grid at the same resolution;
+  * a **global-context branch**: global-average-pool the feature map -> MLP ->
+    broadcast back to every cell, then fuse. Every cell gets a whole-layout
+    summary (the old 4x plain-3x3 trunk only saw a ~9x9 neighbourhood, which
+    correlated with the loose/spread-out placements observed in case 99).
+
+Both the single-sample path (`forward`/`act`, used by the env rollout) and a
+batched path (`forward_batch`, used by the fast trainer) share `_trunk`, which
+accepts either `[C,G,G]` or `[B,C,G,G]`.
 """
 
 from __future__ import annotations
@@ -26,16 +36,24 @@ import torch.nn.functional as F
 class PolicyValueNet(nn.Module):
     def __init__(self, in_channels: int = 4, node_dim: int = 128,
                  node_channels: int = 32, hidden: int = 64, n_conv: int = 4,
-                 n_aspect: int = 5):
+                 n_aspect: int = 5, dilations: Tuple[int, ...] = None):
         super().__init__()
         self.node_proj = nn.Linear(node_dim, node_channels)
 
         chans = in_channels + node_channels
-        convs = []
-        for k in range(n_conv):
-            convs += [nn.Conv2d(chans if k == 0 else hidden, hidden, 3, padding=1),
-                      nn.ReLU()]
-        self.cnn = nn.Sequential(*convs)
+        self.stem = nn.Conv2d(chans, hidden, 3, padding=1)
+
+        # Dilated residual conv stack: dilation doubles each layer so the
+        # receptive field grows exponentially (1,2,4,8,...) at fixed resolution.
+        if dilations is None:
+            dilations = tuple(2 ** k for k in range(n_conv))
+        self.dil_convs = nn.ModuleList(
+            [nn.Conv2d(hidden, hidden, 3, padding=d, dilation=d) for d in dilations])
+
+        # Global-context branch: pool -> MLP -> broadcast -> fuse back.
+        self.global_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+        self.fuse = nn.Conv2d(hidden * 2, hidden, 1)
 
         self.policy_head = nn.Conv2d(hidden, 1, kernel_size=1)
         self.value_head = nn.Sequential(
@@ -44,15 +62,31 @@ class PolicyValueNet(nn.Module):
         self.aspect_head = nn.Linear(hidden, n_aspect)
 
     def _trunk(self, canvas: torch.Tensor, node_emb_current: torch.Tensor):
-        """Shared CNN trunk -> (position logits [G,G], pooled feature [hidden])."""
-        _C, G, _ = canvas.shape
-        x = canvas.unsqueeze(0)                                   # [1,C,G,G]
-        node_vec = self.node_proj(node_emb_current)              # [node_channels]
-        node_map = node_vec.view(1, -1, 1, 1).expand(1, -1, G, G)
-        x = torch.cat([x, node_map], dim=1)                      # [1,C+nc,G,G]
-        feat = self.cnn(x)                                       # [1,hidden,G,G]
-        logits = self.policy_head(feat).view(G, G)              # [G,G]
-        pooled = feat.mean(dim=(2, 3)).view(-1)                  # [hidden]
+        """Shared CNN trunk. Accepts canvas [C,G,G] or [B,C,G,G] and
+        node_emb_current [D] or [B,D]. Returns (logits, pooled) with a leading
+        batch dim iff the input had one (single-sample -> [G,G],[hidden])."""
+        single = (canvas.dim() == 3)
+        if single:
+            canvas = canvas.unsqueeze(0)                       # [1,C,G,G]
+            node_emb_current = node_emb_current.unsqueeze(0)   # [1,D]
+        B, _C, G, _ = canvas.shape
+
+        node_vec = self.node_proj(node_emb_current)            # [B,nc]
+        node_map = node_vec.view(B, -1, 1, 1).expand(B, -1, G, G)
+        x = torch.cat([canvas, node_map], dim=1)               # [B,C+nc,G,G]
+
+        x = F.relu(self.stem(x))                               # [B,hidden,G,G]
+        for conv in self.dil_convs:
+            x = F.relu(conv(x) + x)                            # residual dilated
+
+        g = self.global_mlp(x.mean(dim=(2, 3)))                # [B,hidden]
+        g_map = g.view(B, -1, 1, 1).expand(B, -1, G, G)        # [B,hidden,G,G]
+        x = F.relu(self.fuse(torch.cat([x, g_map], dim=1)))    # [B,hidden,G,G]
+
+        logits = self.policy_head(x).view(B, G, G)             # [B,G,G]
+        pooled = x.mean(dim=(2, 3))                            # [B,hidden]
+        if single:
+            return logits[0], pooled[0]
         return logits, pooled
 
     @staticmethod
@@ -68,8 +102,20 @@ class PolicyValueNet(nn.Module):
         Returns (probs[G*G], value scalar, logits[G,G]). Position-only (Phase 0-4.5)."""
         logits, pooled = self._trunk(canvas, node_emb_current)
         probs = self._masked_probs(logits, feasibility_mask)
-        value = self.value_head(pooled).squeeze()               # scalar
+        value = self.value_head(pooled).squeeze()             # scalar
         return probs, value, logits
+
+    def forward_batch(self, canvas: torch.Tensor, node_emb_current: torch.Tensor,
+                      mask: torch.Tensor = None):
+        """Batched training path. canvas [B,C,G,G], node_emb_current [B,D].
+        Returns (logits[B,G*G], value[B]). Logits are RAW (unmasked) for a stable
+        cross-entropy target (BC trains on raw logits, exactly like the old
+        single-sample path; the feasibility mask is applied only at action time
+        in `act`). `mask` is accepted for API symmetry but unused here."""
+        logits, pooled = self._trunk(canvas, node_emb_current)  # [B,G,G],[B,hidden]
+        B = logits.shape[0]
+        value = self.value_head(pooled).squeeze(-1)             # [B]
+        return logits.view(B, -1), value
 
     def forward_aspect(self, canvas: torch.Tensor, node_emb_current: torch.Tensor,
                        feasibility_mask: torch.Tensor):
