@@ -113,7 +113,17 @@ def main():
 
     gt_positions = _ground_truth_positions(labels, block_count)
 
+    # Build target_positions exactly like iccad2026_evaluate does, so fixed-shape
+    # blocks keep their (w,h) and preplaced blocks their (x,y,w,h) — otherwise the
+    # plot would square-ize fixed blocks and mismatch the actually-scored layout.
     opt_target_pos = torch.full((block_count, 4), -1.0)
+    for i in range(block_count):
+        if constraints[i, 1] != 0:                      # preplaced -> x,y,w,h
+            opt_target_pos[i] = torch.tensor(gt_positions[i])
+        elif constraints[i, 0] != 0:                    # fixed -> w,h only
+            opt_target_pos[i, 2] = gt_positions[i][2]
+            opt_target_pos[i, 3] = gt_positions[i][3]
+
     optimizer = RLSkylineOptimizer(verbose=True, center_source=args.center_source)
     rl_positions = optimizer.solve(
         block_count, area_target, b2b_conn, p2b_conn, pins_pos, constraints, opt_target_pos

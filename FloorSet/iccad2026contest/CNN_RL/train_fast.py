@@ -101,9 +101,26 @@ class BCEpisodeDataset(Dataset):
                 "area": area, "cons": cons, "b2b": b2b, "bc": bc}
 
 
+def _soft_labels(targets: torch.Tensor, G: int, sigma: float) -> torch.Tensor:
+    """[B] target cell indices -> [B, G*G] Gaussian soft labels centred on each
+    target cell (std `sigma` in cells), row-normalised to a probability. Softens
+    the exact-cell target so neighbouring cells also get gradient -> a stabler,
+    less-noisy signal than one-hot cross-entropy (cell_acc stops being all-or-
+    nothing; the model learns 'be near here', which is what the legalizer needs)."""
+    B = targets.shape[0]
+    dev = targets.device
+    tr = (targets // G).float().view(B, 1, 1)        # target row
+    tc = (targets % G).float().view(B, 1, 1)         # target col
+    rows = torch.arange(G, device=dev).float().view(1, G, 1)
+    cols = torch.arange(G, device=dev).float().view(1, 1, G)
+    d2 = (rows - tr) ** 2 + (cols - tc) ** 2          # [B,G,G]
+    w = torch.exp(-d2 / (2.0 * sigma * sigma)).view(B, -1)
+    return w / w.sum(1, keepdim=True).clamp_min(1e-12)
+
+
 def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
           lr=1e-3, accum=8, workers=12, seed=0, ckpt_name="phase10_bc.pt",
-          log_every=100, save_every=2000, device=None, root=None):
+          log_every=100, save_every=2000, device=None, root=None, soft_sigma=0.0):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
     root = root or (str(_FLOORSET_ROOT) + "/")
@@ -117,11 +134,12 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
                         collate_fn=lambda b: b[0],
                         persistent_workers=(workers > 0),
                         prefetch_factor=(4 if workers > 0 else None))
+    mode = f"soft(sigma={soft_sigma})" if soft_sigma > 0 else "hard(cross-entropy)"
     print(f"[train_fast] device={device} workers={workers} "
-          f"samples={len(ds)} x {epochs} epoch(s) grid={grid} accum={accum}")
+          f"samples={len(ds)} x {epochs} epoch(s) grid={grid} accum={accum} loss={mode}")
 
     seen, t0 = 0, time.time()
-    run_loss, run_correct, run_steps = 0.0, 0, 0
+    run_loss, run_correct, run_near, run_steps = 0.0, 0, 0, 0
     opt.zero_grad()
     for ep in range(epochs):
         for sample in loader:
@@ -135,7 +153,11 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
                 sample["area"], sample["cons"], sample["b2b"], sample["bc"],
                 device=device)
             logits, _value = policy.forward_batch(canvas, node_emb[blocks])
-            loss = F.cross_entropy(logits, target)
+            if soft_sigma > 0:
+                soft = _soft_labels(target, grid, soft_sigma)        # [B,G*G]
+                loss = -(soft * F.log_softmax(logits, dim=1)).sum(1).mean()
+            else:
+                loss = F.cross_entropy(logits, target)
             (loss / accum).backward()
 
             seen += 1
@@ -143,15 +165,20 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
                 opt.step()
                 opt.zero_grad()
 
+            pred = logits.argmax(dim=1)
+            run_correct += int((pred == target).sum())
+            # near_acc: predicted cell within Chebyshev +-1 of the GT cell
+            pr, pc, tr2, tc2 = pred // grid, pred % grid, target // grid, target % grid
+            run_near += int((((pr - tr2).abs() <= 1) & ((pc - tc2).abs() <= 1)).sum())
             run_loss += float(loss)
-            run_correct += int((logits.argmax(dim=1) == target).sum())
             run_steps += target.numel()
             if seen % log_every == 0:
                 rate = seen / (time.time() - t0)
                 print(f"  [{seen}] loss={run_loss/log_every:.3f} "
                       f"cell_acc={run_correct/max(run_steps,1):.3f} "
+                      f"near_acc={run_near/max(run_steps,1):.3f} "
                       f"({rate:.1f} samples/s)")
-                run_loss, run_correct, run_steps = 0.0, 0, 0
+                run_loss, run_correct, run_near, run_steps = 0.0, 0, 0, 0
             if seen % save_every == 0:
                 _save(gnn, policy, grid, gnn_out, hidden, ckpt_name, seen, t0)
 
@@ -179,7 +206,9 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ckpt-name", type=str, default="phase10_bc.pt")
     ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--soft-sigma", type=float, default=0.0,
+                    help="Gaussian soft-label std in cells (0 = hard cross-entropy)")
     args = ap.parse_args()
     train(num_samples=args.num_samples, epochs=args.epochs, grid=args.grid,
           accum=args.accum, workers=args.workers, lr=args.lr, seed=args.seed,
-          ckpt_name=args.ckpt_name, device=args.device)
+          ckpt_name=args.ckpt_name, device=args.device, soft_sigma=args.soft_sigma)

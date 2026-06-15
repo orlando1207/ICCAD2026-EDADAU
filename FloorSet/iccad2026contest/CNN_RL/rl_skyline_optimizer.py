@@ -50,7 +50,7 @@ from analytic_legalizer.skyline_legalizer import (  # noqa: E402
 )
 from analytic_legalizer.quadratic_placer import analytic_place  # noqa: E402
 
-_DEFAULT_CKPT = _DL_DIR / "checkpoints" / "phase10_bc.pt"
+_DEFAULT_CKPT = _DL_DIR / "checkpoints" / "phase10_soft.pt"
 
 
 class RLSkylineOptimizer(FloorplanOptimizer):

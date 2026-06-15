@@ -63,7 +63,17 @@ def main():
         positions = _ground_truth_positions(labels, block_count)
         title_suffix = " (ground truth)"
     else:
+        # Build target_positions like iccad2026_evaluate: fixed blocks keep (w,h),
+        # preplaced keep (x,y,w,h) — else the plot square-izes fixed blocks and
+        # won't match the actually-scored layout.
+        gt = _ground_truth_positions(labels, block_count)
         opt_target_pos = torch.full((block_count, 4), -1.0)
+        for i in range(block_count):
+            if constraints[i, 1] != 0:                  # preplaced -> x,y,w,h
+                opt_target_pos[i] = torch.tensor(gt[i])
+            elif constraints[i, 0] != 0:                # fixed -> w,h only
+                opt_target_pos[i, 2] = gt[i][2]
+                opt_target_pos[i, 3] = gt[i][3]
         optimizer = RLSkylineOptimizer(verbose=True, center_source=args.center_source)
         positions = optimizer.solve(
             block_count, area_target, b2b_conn, p2b_conn, pins_pos, constraints, opt_target_pos
