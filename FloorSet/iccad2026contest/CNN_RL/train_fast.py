@@ -190,7 +190,8 @@ def _save(gnn, policy, grid, gnn_out, hidden, ckpt_name, seen, t0):
     CKPT_DIR.mkdir(exist_ok=True)
     path = CKPT_DIR / ckpt_name
     torch.save({"gnn": gnn.state_dict(), "policy": policy.state_dict(),
-                "grid": grid, "gnn_out": gnn_out, "hidden": hidden}, path)
+                "grid": grid, "gnn_out": gnn_out, "hidden": hidden,
+                "in_channels": N_CHANNELS}, path)
     print(f"  saved {path}  ({seen} samples, {time.time()-t0:.1f}s)")
     return str(path)
 

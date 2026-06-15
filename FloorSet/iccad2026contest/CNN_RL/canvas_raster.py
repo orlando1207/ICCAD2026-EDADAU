@@ -28,11 +28,12 @@ from typing import Optional, Tuple
 
 import torch
 
-N_CHANNELS = 4
+N_CHANNELS = 5
 CH_OCCUPANCY = 0
 CH_DENSITY = 1
 CH_WL_PULL = 2
 CH_FEASIBILITY = 3
+CH_PIN_PULL = 4          # HPWL pull toward the current block's connected I/O pins (p2b)
 
 
 def _placed_neighbors(current_block: int,
@@ -69,12 +70,58 @@ def _placed_neighbors(current_block: int,
     return centers, ww
 
 
+def _connected_pins(current_block: int,
+                    p2b: torch.Tensor,
+                    pins: torch.Tensor):
+    """Return (pin_centers[K,2], weights[K]) of I/O pins connected to
+    `current_block` via p2b edges. Pins are fixed terminals (always "placed"),
+    so unlike b2b neighbours there is no placed/unplaced filter. p2b rows are
+    (pin_idx, block_idx, weight). Fully vectorised."""
+    if p2b is None or p2b.numel() == 0 or pins is None or pins.numel() == 0:
+        return None, None
+    valid = p2b[p2b[:, 0] >= 0]
+    if valid.numel() == 0:
+        return None, None
+    pin_i = valid[:, 0].long()
+    blk_j = valid[:, 1].long()
+    w = valid[:, 2]
+    sel = (blk_j == current_block) & (pin_i < pins.shape[0])
+    pin_i = pin_i[sel]
+    ww = w[sel]
+    if pin_i.numel() == 0:
+        return None, None
+    centers = pins[pin_i][:, :2].float()             # [K,2] = (px, py)
+    return centers, ww
+
+
+def _pull_field(centers, weights, G, cell_w, cell_h, cw, ch, device):
+    """[0,1] field over the G×G grid: high where placing the current block's
+    CENTER gives LOW total weighted Manhattan distance to `centers`. Shared by
+    the b2b (wl_pull) and pin (pin_pull) channels."""
+    centers = centers.to(device)
+    weights = weights.to(device)
+    cols = torch.arange(G, device=device).float()
+    rows = torch.arange(G, device=device).float()
+    cx = (cols * cell_w + cw / 2).view(1, 1, G)       # [1,1,G] block-center x per col
+    cy = (rows * cell_h + ch / 2).view(1, G, 1)       # [1,G,1] block-center y per row
+    nx = centers[:, 0].view(-1, 1, 1)
+    ny = centers[:, 1].view(-1, 1, 1)
+    cost = (weights.view(-1, 1, 1)
+            * ((cx - nx).abs() + (cy - ny).abs())).sum(0)   # [G,G]
+    cmin, cmax = cost.min(), cost.max()
+    if (cmax - cmin) > 1e-9:
+        return 1.0 - (cost - cmin) / (cmax - cmin)
+    return torch.ones((G, G), device=device)
+
+
 def rasterize(positions: torch.Tensor,
               canvas: Tuple[float, float],
               grid: int,
               current_block: Optional[int] = None,
               current_dims: Optional[Tuple[float, float]] = None,
               b2b: Optional[torch.Tensor] = None,
+              p2b: Optional[torch.Tensor] = None,
+              pins: Optional[torch.Tensor] = None,
               device: str = "cpu") -> torch.Tensor:
     """Build the [N_CHANNELS, grid, grid] state image. See module docstring."""
     canvas_w, canvas_h = canvas
@@ -106,31 +153,17 @@ def rasterize(positions: torch.Tensor,
         out[CH_DENSITY] = density
         out[CH_OCCUPANCY] = (density > 0).float()
 
-    # --- channel 2: wirelength pull for the current block ----------------
+    # --- channel 2: b2b wirelength pull; channel 4: pin (p2b) pull -------
     if current_block is not None and current_dims is not None:
         cw, ch = current_dims
         centers, weights = _placed_neighbors(current_block, positions, b2b)
         if centers is not None:
-            centers = centers.to(device)
-            weights = weights.to(device)
-            # cell-center coords of where this block's CENTER would land
-            cols = torch.arange(G, device=device).float()
-            rows = torch.arange(G, device=device).float()
-            cx = cols * cell_w + cw / 2            # [G]  (x per col)
-            cy = rows * cell_h + ch / 2            # [G]  (y per row)
-            cx_grid = cx.view(1, 1, G)             # [1,1,G]
-            cy_grid = cy.view(1, G, 1)             # [1,G,1]
-            nx = centers[:, 0].view(-1, 1, 1)      # [K,1,1]
-            ny = centers[:, 1].view(-1, 1, 1)      # [K,1,1]
-            # weighted Manhattan distance summed over neighbours, vectorised
-            cost = (weights.view(-1, 1, 1)
-                    * ((cx_grid - nx).abs() + (cy_grid - ny).abs())).sum(0)  # [G,G]
-            # invert + normalise to [0,1]: high pull == low HPWL cost
-            cmin, cmax = cost.min(), cost.max()
-            if (cmax - cmin) > 1e-9:
-                out[CH_WL_PULL] = 1.0 - (cost - cmin) / (cmax - cmin)
-            else:
-                out[CH_WL_PULL] = torch.ones((G, G), device=device)
+            out[CH_WL_PULL] = _pull_field(centers, weights, G, cell_w, cell_h,
+                                          cw, ch, device)
+        pin_centers, pin_w = _connected_pins(current_block, p2b, pins)
+        if pin_centers is not None:
+            out[CH_PIN_PULL] = _pull_field(pin_centers, pin_w, G, cell_w, cell_h,
+                                           cw, ch, device)
 
     # --- channel 3: feasibility mask -------------------------------------
     if current_dims is not None:
@@ -166,5 +199,7 @@ def rasterize_env(env, device: Optional[str] = None) -> torch.Tensor:
         current_block=current_block,
         current_dims=current_dims,
         b2b=env.b2b,
+        p2b=getattr(env, "p2b", None),
+        pins=getattr(env, "pins_pos", None),
         device=device or env.device,
     )

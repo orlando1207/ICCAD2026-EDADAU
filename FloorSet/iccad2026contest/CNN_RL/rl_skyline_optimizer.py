@@ -50,7 +50,7 @@ from analytic_legalizer.skyline_legalizer import (  # noqa: E402
 )
 from analytic_legalizer.quadratic_placer import analytic_place  # noqa: E402
 
-_DEFAULT_CKPT = _DL_DIR / "checkpoints" / "phase10_soft.pt"
+_DEFAULT_CKPT = _DL_DIR / "checkpoints" / "phase11_pin_soft.pt"
 
 
 class RLSkylineOptimizer(FloorplanOptimizer):
@@ -59,9 +59,10 @@ class RLSkylineOptimizer(FloorplanOptimizer):
     _detailed_place)."""
 
     def __init__(self, verbose: bool = False, checkpoint=None,
-                 center_source: str = "model"):
+                 center_source: str = "model", compact_pass: bool = False):
         super().__init__(verbose)
         self.center_source = center_source
+        self.compact_pass = compact_pass        # extra whitespace compaction (experiment)
         self._model = None
         if center_source == "model":
             ckpt_path = Path(checkpoint) if checkpoint else _DEFAULT_CKPT
@@ -71,8 +72,8 @@ class RLSkylineOptimizer(FloorplanOptimizer):
                     from policy_net import PolicyValueNet
                     ck = torch.load(ckpt_path, map_location="cpu")
                     gnn = GNNEncoder(out_dim=ck["gnn_out"], hidden=ck["hidden"])
-                    pol = PolicyValueNet(in_channels=4, node_dim=ck["gnn_out"],
-                                         hidden=ck["hidden"])
+                    pol = PolicyValueNet(in_channels=ck.get("in_channels", 4),
+                                         node_dim=ck["gnn_out"], hidden=ck["hidden"])
                     gnn.load_state_dict(ck["gnn"])
                     pol.load_state_dict(ck["policy"])
                     gnn.eval()
@@ -155,6 +156,9 @@ class RLSkylineOptimizer(FloorplanOptimizer):
             blocks, super_blocks, cluster_groups, cx, cy, area_targets,
             b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
         )
+        if self.compact_pass:                       # squeeze residual whitespace
+            from analytic_legalizer.topology import compact
+            pos = compact(pos, blocks, super_blocks, cluster_groups)
         pos = slide_boundary(pos, blocks, super_blocks, cluster_groups)
         pos = enforce_hard(pos, blocks, area_targets)
         pos = _detailed_place(pos, blocks, b2b_connectivity, p2b_connectivity, pins_pos)

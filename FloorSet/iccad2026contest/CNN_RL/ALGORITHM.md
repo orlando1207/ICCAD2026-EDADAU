@@ -63,6 +63,47 @@ into a `G x G` grid (grid size is a hyperparameter, used 16–84 across phases).
 
 ---
 
+## Architecture data flow (GNN + CNN → RL)
+
+Two encoders in series feed the RL decision; **both are always used**.
+
+```
+   netlist graph ──GNN──▶ per-block embeddings ┐
+   (blocks=nodes, b2b=edges)   [N, D]           │
+                                                ├─▶ CNN (policy_net) ─▶ [G,G] logits
+   partial placement ──rasterize──▶ [C,G,G] ────┘        │  (+ value, + aspect heads)
+   (occupancy/density/wl_pull/…)   canvas                │
+                                                         ▼
+                                          mask illegal cells, softmax
+                                                         │
+                                              sample / argmax a cell
+                                                         │
+                                          env.step → place block, update canvas
+                                                         │
+                                       (repeat for every block, in order)
+                                                         ▼
+                                   per-block centers (cx,cy) ─▶ skyline legalize
+                                                         ▼
+                            reward = −(legalized contest cost)  → PPO / BC update
+```
+
+| | **GNN** (graph half) | **CNN** (vision half) |
+|---|---|---|
+| Module | `gnn_encoder.py` | `policy_net.py` |
+| Input | netlist: node features `[N,10]` + b2b edges | canvas raster `[C,G,G]` + current block's GNN embedding (broadcast as channels) |
+| Sees | **connectivity / topology** (who connects to whom, area, constraints) — no coordinates | **spatial geometry** (what's placed where, density, low-HPWL spots, legal cells) |
+| Output | one embedding per block `[N,D]` | per-cell placement logits `[G,G]` (+ value, + aspect) |
+| Runs | **once per problem** (netlist is static) | **once per block** (canvas changes each step) |
+
+The current block's GNN embedding conditions the CNN, so the spatial "where to
+place" decision knows *which* block (and its graph context) it is placing.
+GNN = "what is this block and what's it wired to"; CNN = "what does the layout
+look like and where's a good spot". The **same GNN+CNN produce the centers**
+that the (Phase 9) skyline legalizer consumes — switching the legalizer did not
+replace either encoder.
+
+---
+
 ## Pipeline / Components
 
 ### Step 1 — Environment (`placement_env.py`)
@@ -83,17 +124,26 @@ into a `G x G` grid (grid size is a hyperparameter, used 16–84 across phases).
   since preplaced blocks are excluded from `order`)
 
 ### Step 2 — Canvas rasterizer (`canvas_raster.py`)
-`rasterize(positions, canvas, grid, current_block, current_dims, b2b, device)`
--> `Tensor[4, G, G]`, channels:
+`rasterize(positions, canvas, grid, current_block, current_dims, b2b, p2b, pins, device)`
+-> `Tensor[N_CHANNELS, G, G]`, channels:
 
 | Ch | Name | Meaning |
 |---|---|---|
 | 0 | `CH_OCCUPANCY` | 1 where any placed block covers the cell |
 | 1 | `CH_DENSITY` | count of placed blocks covering the cell (overlap signal) |
-| 2 | `CH_WL_PULL` | for the current block, a [0,1] field high where placing it gives LOW weighted HPWL to its placed neighbours |
+| 2 | `CH_WL_PULL` | for the current block, a [0,1] field high where placing it gives LOW weighted HPWL to its placed **b2b neighbours** |
 | 3 | `CH_FEASIBILITY` | 1 where the current block's lower-left corner can legally go (fits in canvas) |
+| 4 | `CH_PIN_PULL` | for the current block, a [0,1] field high where placing it gives LOW weighted HPWL to its connected **I/O pins** (p2b) — added so the model finally "sees" pins |
 
 `rasterize_env(env)` is the adapter used by the policy/training code.
+
+> **Pins/p2b feature (this phase).** Previously the model was blind to pin
+> locations (GNN used b2b only; wl_pull used b2b only) — a likely cause of the
+> "blocks spill past the pin ring" artefact. `CH_PIN_PULL` adds a pin-aware
+> spatial signal with the same construction as `CH_WL_PULL`, but using the fixed
+> pin coordinates of the current block's `p2b` edges (pins are always "placed").
+> `N_CHANNELS` is now 5; the saved checkpoint records `in_channels` so the
+> optimizer/loaders pick the right width (old 4-channel checkpoints still load).
 
 ### Step 3 — GNN encoder (`gnn_encoder.py`)
 Pure-PyTorch hand-rolled message passing (GraphSAGE-style weighted-mean
