@@ -15,14 +15,28 @@ Evaluated with the corrected scoring formula (`Total Score = Σ Cost[i]·e^{n_i/
 | Optimizer | Avg Cost | Total Score | Feasible |
 |---|---|---|---|
 | `analytic_legalizer/my_optimizer.py` (baseline) | 2.0632 | 1.9788 | 100/100 |
-| **`rl_skyline_optimizer.py`** (default, `phase11_pin_soft.pt`) | **2.0172** | **1.8977** | 100/100 |
-| `rl_skyline_optimizer_compact.py` (+ whitespace compaction) | 2.0351 | 1.9242 | 100/100 |
+| `rl_skyline_optimizer.py` (Phase 11, `phase11_pin_soft.pt`, square soft blocks) | 2.0172 | 1.8977 | 100/100 |
+| `rl_skyline_optimizer.py` (Phase 13, `phase13_aspect.pt`, predicted aspect ratios) | 1.9705 | 1.8650 | 100/100 |
+| **`rl_skyline_optimizer.py`** (default, Phase 15/B1 contour-aware shaping, `shape_fit=True`) | **1.9593** | **1.8517** | 100/100 |
+| `rl_skyline_optimizer.py` (`phase14_aspect_100k.pt`, 100k-sample continuation) | 2.0281 | 1.9159 | 100/100 |
+| `rl_skyline_optimizer_compact.py` (+ whitespace compaction, on Phase 11 ckpt) | 2.0351 | 1.9242 | 100/100 |
 
 `rl_skyline_optimizer.py` is the file to submit/use — it currently **beats the
-analytic baseline** on both metrics. `rl_skyline_optimizer_compact.py` adds a
-whitespace-compaction pass that is a net loss on this checkpoint; kept around
-because the compaction logic hasn't been tried with the newer pin-aware
-checkpoint yet.
+analytic baseline** on both metrics. Phase 13 adds an aspect-ratio head: for
+"free" soft blocks (no fixed/MIB/cluster shape constraint), the policy picks a
+non-square aspect bucket (`ar_utils.ASPECT_BUCKETS`) instead of the default
+forced square, area-preserving (`aspect_pass=True`). **Phase 15/B1**
+(`shape_fit=True`, now default) adds *contour-aware in-packer shaping*
+(`skyline_shape.py`): when the skyline packer lands a soft block it picks the
+area-constant aspect that best fills the current contour notch, as a third
+candidate mode that is never worse than stock — 1.8650 → 1.8517. See
+`ALGORITHM.md` §"Aspect Ratio" for the PoC that motivated it (a free-blocks-only
+post-pass measured 0.00; shaping must live *inside* the packer).
+`phase14_aspect_100k.pt` continued training from Phase 13 on 80k fresh samples
+(indices 20k–100k) but **regressed** (1.9705→2.0281 avg cost) despite better
+training-curve metrics — `phase13_aspect.pt` remains the default checkpoint.
+`rl_skyline_optimizer_compact.py` adds a whitespace-compaction pass that was a
+net loss on the Phase 11 checkpoint; not yet retried.
 
 ## Quick start
 
@@ -52,15 +66,38 @@ One script, `train_fast.py` — vectorised rasterizer + batched GNN/CNN forward
 ```bash
 python3 CNN_RL/train_fast.py \
     --num-samples 20000 --epochs 1 --grid 64 --workers 16 \
-    --soft-sigma 1.5 --ckpt-name phase11_pin_soft.pt
+    --soft-sigma 1.5 --aspect-weight 0.5 --ckpt-name phase13_aspect.pt
 ```
 
 - `--soft-sigma 1.5`: Gaussian-blurred target-cell label (soft cross-entropy)
   instead of one-hot — improved avg cost 2.0944 -> 2.0570.
 - The 5th raster channel (`CH_PIN_PULL`, pin-aware HPWL field, always on in
   `canvas_raster.py`) improved avg cost 2.0570 -> 2.0408.
+- `--aspect-weight 0.5`: weight of the aspect-bucket BC loss (Phase 13) —
+  predicts a non-square shape for "free" soft blocks, avg cost 2.0172 -> 1.9705.
 - Checkpoint is written to `checkpoints/<ckpt-name>`; `rl_skyline_optimizer.py`
-  loads `checkpoints/phase11_pin_soft.pt` by default (`_DEFAULT_CKPT`).
+  loads `checkpoints/phase13_aspect.pt` by default (`_DEFAULT_CKPT`).
+
+### Continue training (more data, same checkpoint)
+
+The full dataset has 1,008,000 samples, so a 20k run only ever sees indices
+`[0, 20000)`. To keep training the same model on fresh data:
+
+```bash
+python3 CNN_RL/train_fast.py \
+    --num-samples 20000 --start-idx 20000 \
+    --epochs 1 --grid 64 --workers 16 \
+    --soft-sigma 1.5 --aspect-weight 0.5 \
+    --init-ckpt CNN_RL/checkpoints/phase13_aspect.pt \
+    --ckpt-name phase13_aspect.pt
+```
+
+- `--init-ckpt <path>`: load gnn/policy weights from an existing checkpoint
+  before training (optimizer state is fresh Adam, not resumed).
+- `--start-idx N`: skip the first `N` dataset samples, so the next run trains
+  on data the model hasn't seen yet instead of repeating the same slice.
+- `--ckpt-name` overwrites in place if it matches `--init-ckpt`, or use a new
+  name (e.g. `phase14_aspect.pt`) to A/B against the previous checkpoint.
 
 ### Run the acceptance tests
 
@@ -89,18 +126,23 @@ CNN_RL/
 ├── canvas_raster.py                  # partial placement -> [5,G,G] raster
 ├── gnn_encoder.py                    # netlist -> node embeddings (SAGE-style)
 ├── policy_net.py                     # CNN trunk + policy/value heads
+├── ar_utils.py                       # aspect-ratio bucket utilities (Phase 5/13)
+├── skyline_shape.py                  # Phase 15/B1 contour-aware in-packer shaping (skyline_legalize_shaped)
+├── topo_shape.py                     # Phase 15/B2 critical-path slack shaping (legalize_b2, off by default)
+├── poc_slack_shaping.py              # Phase 15 PoC: measures the Area_gap ceiling of block reshaping
 ├── pretrain_bc.py / train_phase8.py  # utility modules imported by train_fast.py
 ├── hard_constraints.py               # hard-constraint snapping used by placement_env.py
 ├── plot_rl_skyline.py / plot_compare.py  # visualization helpers
 ├── test_*.py                         # one acceptance test per active module
-├── checkpoints/phase11_pin_soft.pt   # current default checkpoint
+├── checkpoints/phase13_aspect.pt     # current default checkpoint (Phase 13, 20k samples, aspect-ratio head)
+├── checkpoints/phase14_aspect_100k.pt  # Phase 14 continuation (100k samples total) — net loss, not default
 ├── ALGORITHM.md                      # full phase-by-phase history & lessons
 └── archive/                          # deprecated/abandoned, kept for reference
     ├── rl_optimizer.py               # Phase 7/8 (Total Score 10.05 / 15.60)
     ├── train_ppo.py                  # Phase 12 PPO+KL-anchor (abandoned)
-    ├── ar_utils.py / test_ar_utils.py     # Phase 5 aspect-ratio action head (unused)
+    ├── test_ar_utils.py              # Phase 5 acceptance test for the aspect-ratio head
     ├── train_rl.py / test_train_rl.py     # Phase 4 PPO loop, superseded by train_fast.py
-    ├── checkpoints/                  # old/intermediate checkpoints
+    ├── checkpoints/                  # old/intermediate checkpoints incl. phase11_pin_soft.pt
     └── HANDOFF.md, VERSION_B_RL_PLACER.md  # superseded planning docs
 ```
 
@@ -155,9 +197,13 @@ b2b wirelength-pull, feasibility mask, **pin-pull** (p2b HPWL field, Phase 11).
 | Phase 9 — RL centers -> `skyline_legalize` | 2.0931 | same checkpoint, -75% by reusing analytic's legalizer |
 | Phase 10 — hard-label BC, 20k samples | 2.0944 | more data alone ~flat |
 | Phase 10 — + soft-label CE (`soft-sigma=1.5`) | 2.0570 | |
-| Phase 11 — + pin-pull channel (`CH_PIN_PULL`) | **2.0408** | current default |
+| Phase 11 — + pin-pull channel (`CH_PIN_PULL`) | 2.0408 | superseded by Phase 13 |
 | Phase 11 + compaction pass | 2.0351 (avg) / Total Score 1.9242 | net loss vs 1.8977 — kept as `_compact` variant |
 | Phase 12 — PPO + KL-anchor fine-tune | no improvement | abandoned, see `archive/train_ppo.py` |
+| Phase 13 — + aspect-ratio head for "free" soft blocks | 1.9705 (avg) / Total Score 1.8650 | `phase13_aspect.pt`, 20k samples |
+| Phase 14 — continued training on 80k fresh samples (`--init-ckpt phase13 --start-idx 20000`) | 2.0281 (avg) / Total Score 1.9159 | **net loss** — despite better training metrics; fresh Adam on resume likely cause |
+| Phase 15/B1 — contour-aware in-packer shaping (`skyline_shape.py`, `shape_fit=True`) | **1.9593 (avg) / Total Score 1.8517** | current default; never-worse third pack mode |
+| Phase 15/B2 — critical-path slack shaping (`topo_shape.py`, `b2_pass=True`) | 1.9550 (avg) / Total Score 1.8517 | off by default — improves Avg Cost but **Total Score flat** (wins are on small cases) |
 | `analytic_legalizer` baseline | 2.0632 (avg) / Total Score 1.9788 | CNN_RL now beats this |
 
 ### Key lessons
@@ -176,6 +222,19 @@ b2b wirelength-pull, feasibility mask, **pin-pull** (p2b HPWL field, Phase 11).
 4. Training is CPU-bound on the rasterizer, not the CNN forward — parallel
    `DataLoader` workers (`--workers`) are the lever that scales
    (~1.4 -> 10+ samples/s).
+5. **The "shape lever"**: forcing every soft block to a square (`w=h=sqrt(area)`)
+   was a real cost. Phase 13's `aspect_head` picks one of
+   `ar_utils.ASPECT_BUCKETS` per "free" block (BC-trained on GT aspect ratios,
+   `aspect_acc` ~0.46-0.48 vs 0.20 chance) and overrides that block's (w,h)
+   area-preservingly before legalization — 2.0172 -> 1.9705.
+6. **Continuing BC training on fresh data can hurt** (Phase 14). Resuming from
+   a checkpoint with `--init-ckpt` resets the Adam optimizer state (momentum
+   and variance are cold), which can cause a destabilizing transient in the
+   early steps of the continuation run. Despite better training-curve metrics
+   (`cell_acc` 0.09→0.15, `aspect_acc` 0.47→0.52), eval cost regressed
+   1.9705→2.0281. Possible mitigations: lower `--lr` for continuation runs
+   (e.g. `1e-4` vs default `1e-3`), or save/restore optimizer state alongside
+   model weights.
 
 For full phase-by-phase detail, failure modes, and file-level notes, see
 [`ALGORITHM.md`](ALGORITHM.md). For deprecated/abandoned code, see

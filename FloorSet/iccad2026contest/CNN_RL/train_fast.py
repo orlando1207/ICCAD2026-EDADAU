@@ -51,6 +51,7 @@ from policy_net import PolicyValueNet  # noqa: E402
 from pretrain_bc import _target_cell, CKPT_DIR  # noqa: E402
 from hard_constraints import make_target_positions_from_gt  # noqa: E402
 from train_phase8 import boxes_from_fp_sol  # noqa: E402
+from ar_utils import ASPECT_BUCKETS, gt_aspect_bucket  # noqa: E402
 
 
 class BCEpisodeDataset(Dataset):
@@ -60,10 +61,12 @@ class BCEpisodeDataset(Dataset):
     Rasters are built on CPU (workers can't share a CUDA context); the main
     process moves them to the GPU for the batched forward."""
 
-    def __init__(self, root: str, grid: int, num_samples: int = None):
+    def __init__(self, root: str, grid: int, num_samples: int = None, start_idx: int = 0):
         self.base = FloorplanDatasetLite(root)
         self.grid = grid
-        self.n = len(self.base) if num_samples is None else min(num_samples, len(self.base))
+        self.start_idx = start_idx
+        available = len(self.base) - start_idx
+        self.n = available if num_samples is None else min(num_samples, available)
         self._env = None
 
     def __len__(self):
@@ -73,7 +76,7 @@ class BCEpisodeDataset(Dataset):
         if self._env is None:                       # one env per worker process
             self._env = PlacementEnv(grid=self.grid)
         env = self._env
-        s = self.base[idx]
+        s = self.base[self.start_idx + idx]
         area, b2b, p2b, pins, cons = s["input"]
         _tree, fp_sol, metrics = s["label"]
         bc = int((area != -1).sum())
@@ -81,7 +84,7 @@ class BCEpisodeDataset(Dataset):
         tp = make_target_positions_from_gt(cons, boxes, bc)
         env.reset(area, b2b, p2b, pins, cons, metrics, target_positions=tp)
 
-        canvases, blocks, targets = [], [], []
+        canvases, blocks, targets, aspect_targets, aspect_mask = [], [], [], [], []
         done = len(env.order) == 0
         while not done:
             st = env._build_state()
@@ -90,7 +93,15 @@ class BCEpisodeDataset(Dataset):
             gx, gy, gw, gh = (float(v) for v in boxes[cur])
             targets.append(_target_cell(env, gx, gy, gw, gh))
             blocks.append(cur)
-            env.step(targets[-1])
+            # "free" blocks: shape is not pinned by fixed/MIB/cluster constraints,
+            # so the aspect head can pick the bucket -> w,h is GT-derived.
+            is_free = (cur not in env.fixed_dims and cur not in env.mib_dims
+                       and int(cons[cur, 3]) == 0)
+            ar_bucket = gt_aspect_bucket(gw, gh)
+            aspect_targets.append(ar_bucket)
+            aspect_mask.append(is_free)
+            aspect = ASPECT_BUCKETS[ar_bucket] if is_free else 1.0
+            env.step(targets[-1], aspect=aspect)
             done = env.ptr >= len(env.order)
 
         if not canvases:                            # all-preplaced -> skip
@@ -98,6 +109,8 @@ class BCEpisodeDataset(Dataset):
         return {"canvas": torch.stack(canvases),                       # [B,4,G,G] fp16
                 "blocks": torch.tensor(blocks, dtype=torch.long),      # [B]
                 "target": torch.tensor(targets, dtype=torch.long),     # [B]
+                "aspect_target": torch.tensor(aspect_targets, dtype=torch.long),  # [B]
+                "aspect_mask": torch.tensor(aspect_mask, dtype=torch.bool),       # [B]
                 "area": area, "cons": cons, "b2b": b2b, "bc": bc}
 
 
@@ -120,16 +133,22 @@ def _soft_labels(targets: torch.Tensor, G: int, sigma: float) -> torch.Tensor:
 
 def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
           lr=1e-3, accum=8, workers=12, seed=0, ckpt_name="phase10_bc.pt",
-          log_every=100, save_every=2000, device=None, root=None, soft_sigma=0.0):
+          log_every=100, save_every=2000, device=None, root=None, soft_sigma=0.0,
+          aspect_weight=0.5, init_ckpt=None, start_idx=0):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
     root = root or (str(_FLOORSET_ROOT) + "/")
     gnn = GNNEncoder(out_dim=gnn_out, hidden=hidden).to(device)
     policy = PolicyValueNet(in_channels=N_CHANNELS, node_dim=gnn_out,
                             hidden=hidden).to(device)
+    if init_ckpt:                                    # resume from an existing checkpoint
+        ck = torch.load(init_ckpt, map_location=device)
+        gnn.load_state_dict(ck["gnn"])
+        policy.load_state_dict(ck["policy"])
+        print(f"[train_fast] resumed weights from {init_ckpt}")
     opt = torch.optim.Adam(list(gnn.parameters()) + list(policy.parameters()), lr=lr)
 
-    ds = BCEpisodeDataset(root, grid=grid, num_samples=num_samples)
+    ds = BCEpisodeDataset(root, grid=grid, num_samples=num_samples, start_idx=start_idx)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=workers,
                         collate_fn=lambda b: b[0],
                         persistent_workers=(workers > 0),
@@ -140,6 +159,7 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
 
     seen, t0 = 0, time.time()
     run_loss, run_correct, run_near, run_steps = 0.0, 0, 0, 0
+    run_aspect_loss, run_aspect_correct, run_aspect_steps = 0.0, 0, 0
     opt.zero_grad()
     for ep in range(epochs):
         for sample in loader:
@@ -148,16 +168,25 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
             canvas = sample["canvas"].to(device).float()    # [B,4,G,G]
             blocks = sample["blocks"].to(device)
             target = sample["target"].to(device)
+            aspect_target = sample["aspect_target"].to(device)
+            aspect_mask = sample["aspect_mask"].to(device)
 
             node_emb, _ = gnn.encode_problem(
                 sample["area"], sample["cons"], sample["b2b"], sample["bc"],
                 device=device)
-            logits, _value = policy.forward_batch(canvas, node_emb[blocks])
+            logits, _value, aspect_logits = policy.forward_batch(canvas, node_emb[blocks])
             if soft_sigma > 0:
                 soft = _soft_labels(target, grid, soft_sigma)        # [B,G*G]
-                loss = -(soft * F.log_softmax(logits, dim=1)).sum(1).mean()
+                pos_loss = -(soft * F.log_softmax(logits, dim=1)).sum(1).mean()
             else:
-                loss = F.cross_entropy(logits, target)
+                pos_loss = F.cross_entropy(logits, target)
+
+            if aspect_mask.any():
+                aspect_loss = F.cross_entropy(aspect_logits[aspect_mask],
+                                              aspect_target[aspect_mask])
+            else:
+                aspect_loss = torch.zeros((), device=device)
+            loss = pos_loss + aspect_weight * aspect_loss
             (loss / accum).backward()
 
             seen += 1
@@ -170,15 +199,23 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
             # near_acc: predicted cell within Chebyshev +-1 of the GT cell
             pr, pc, tr2, tc2 = pred // grid, pred % grid, target // grid, target % grid
             run_near += int((((pr - tr2).abs() <= 1) & ((pc - tc2).abs() <= 1)).sum())
-            run_loss += float(loss)
+            run_loss += float(pos_loss)
             run_steps += target.numel()
+            if aspect_mask.any():
+                aspect_pred = aspect_logits.argmax(dim=1)
+                run_aspect_correct += int((aspect_pred[aspect_mask] == aspect_target[aspect_mask]).sum())
+                run_aspect_steps += int(aspect_mask.sum())
+                run_aspect_loss += float(aspect_loss)
             if seen % log_every == 0:
                 rate = seen / (time.time() - t0)
                 print(f"  [{seen}] loss={run_loss/log_every:.3f} "
                       f"cell_acc={run_correct/max(run_steps,1):.3f} "
                       f"near_acc={run_near/max(run_steps,1):.3f} "
+                      f"aspect_loss={run_aspect_loss/log_every:.3f} "
+                      f"aspect_acc={run_aspect_correct/max(run_aspect_steps,1):.3f} "
                       f"({rate:.1f} samples/s)")
                 run_loss, run_correct, run_near, run_steps = 0.0, 0, 0, 0
+                run_aspect_loss, run_aspect_correct, run_aspect_steps = 0.0, 0, 0
             if seen % save_every == 0:
                 _save(gnn, policy, grid, gnn_out, hidden, ckpt_name, seen, t0)
 
@@ -209,7 +246,16 @@ if __name__ == "__main__":
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--soft-sigma", type=float, default=0.0,
                     help="Gaussian soft-label std in cells (0 = hard cross-entropy)")
+    ap.add_argument("--aspect-weight", type=float, default=0.5,
+                    help="weight of the aspect-ratio-bucket CE loss (Phase 13)")
+    ap.add_argument("--init-ckpt", type=str, default=None,
+                    help="resume gnn/policy weights from this checkpoint before training")
+    ap.add_argument("--start-idx", type=int, default=0,
+                    help="dataset index to start sampling from (use with --init-ckpt "
+                         "to continue on fresh data, e.g. --start-idx 20000)")
     args = ap.parse_args()
     train(num_samples=args.num_samples, epochs=args.epochs, grid=args.grid,
           accum=args.accum, workers=args.workers, lr=args.lr, seed=args.seed,
-          ckpt_name=args.ckpt_name, device=args.device, soft_sigma=args.soft_sigma)
+          ckpt_name=args.ckpt_name, device=args.device, soft_sigma=args.soft_sigma,
+          aspect_weight=args.aspect_weight, init_ckpt=args.init_ckpt,
+          start_idx=args.start_idx)

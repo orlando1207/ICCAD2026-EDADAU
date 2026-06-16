@@ -108,14 +108,16 @@ class PolicyValueNet(nn.Module):
     def forward_batch(self, canvas: torch.Tensor, node_emb_current: torch.Tensor,
                       mask: torch.Tensor = None):
         """Batched training path. canvas [B,C,G,G], node_emb_current [B,D].
-        Returns (logits[B,G*G], value[B]). Logits are RAW (unmasked) for a stable
-        cross-entropy target (BC trains on raw logits, exactly like the old
-        single-sample path; the feasibility mask is applied only at action time
-        in `act`). `mask` is accepted for API symmetry but unused here."""
+        Returns (logits[B,G*G], value[B], aspect_logits[B,n_aspect]). Position
+        logits are RAW (unmasked) for a stable cross-entropy target (BC trains
+        on raw logits, exactly like the old single-sample path; the
+        feasibility mask is applied only at action time in `act`). `mask` is
+        accepted for API symmetry but unused here."""
         logits, pooled = self._trunk(canvas, node_emb_current)  # [B,G,G],[B,hidden]
         B = logits.shape[0]
         value = self.value_head(pooled).squeeze(-1)             # [B]
-        return logits.view(B, -1), value
+        aspect_logits = self.aspect_head(pooled)                 # [B,n_aspect]
+        return logits.view(B, -1), value, aspect_logits
 
     def forward_aspect(self, canvas: torch.Tensor, node_emb_current: torch.Tensor,
                        feasibility_mask: torch.Tensor):
