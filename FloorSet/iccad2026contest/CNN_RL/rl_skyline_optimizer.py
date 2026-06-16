@@ -63,13 +63,14 @@ class RLSkylineOptimizer(FloorplanOptimizer):
     def __init__(self, verbose: bool = False, checkpoint=None,
                  center_source: str = "model", compact_pass: bool = False,
                  aspect_pass: bool = True, shape_fit: bool = True,
-                 b2_pass: bool = False):
+                 b2_pass: bool = False, boundary_pass: bool = False):
         super().__init__(verbose)
         self.center_source = center_source
         self.compact_pass = compact_pass        # extra whitespace compaction (experiment)
         self.aspect_pass = aspect_pass          # predict soft-block aspect ratio (Phase 13)
         self.shape_fit = shape_fit              # contour-aware in-packer shaping (Phase 15/B1)
         self.b2_pass = b2_pass                  # critical-path slack shaping (Phase 15/B2)
+        self.boundary_pass = boundary_pass      # TOP/RIGHT boundary reshape (Item A)
         self._model = None
         if center_source == "model":
             ckpt_path = Path(checkpoint) if checkpoint else _DEFAULT_CKPT
@@ -238,6 +239,14 @@ class RLSkylineOptimizer(FloorplanOptimizer):
                                    p2b_connectivity, pins_pos)
 
         pos = _finish(pos)
+
+        if self.boundary_pass:                       # Item A: TOP/RIGHT boundary reshape
+            try:
+                from boundary_shape import boundary_reshape
+                pos = boundary_reshape(pos, blocks, constraints, area_targets)
+            except Exception as e:  # pragma: no cover
+                if self.verbose:
+                    print(f"[RLSkyline] boundary reshape failed ({e})")
 
         if self.b2_pass:                             # Phase 15/B2: critical-path shaping
             try:
