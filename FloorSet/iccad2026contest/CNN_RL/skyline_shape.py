@@ -29,11 +29,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from analytic_legalizer.skyline_legalizer import (  # pure helpers, not modified
+from legalizer.skyline_legalizer import (  # pure helpers, not modified
     Skyline, _build_units, _materialize, _raw_hpwl, _count_boundary_unmet,
     _row_assign_reshape, _pack_one_width, AR_MAX,
 )
-from analytic_legalizer.constraints import (
+from legalizer.constraints import (
     BlockInfo, SuperBlock,
     BOUND_LEFT, BOUND_RIGHT, BOUND_TOP, BOUND_BOTTOM,
 )

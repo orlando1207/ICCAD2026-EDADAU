@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 from typing import List, Tuple
 
-from analytic_legalizer.constraints import (
+from legalizer.constraints import (
     BOUND_LEFT, BOUND_RIGHT, BOUND_TOP, BOUND_BOTTOM,
 )
 

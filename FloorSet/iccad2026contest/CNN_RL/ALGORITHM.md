@@ -309,7 +309,7 @@ of forced squares lowers cost from ~1.16-1.43 down to 1.00 (area/HPWL gap
 mostly closes) — the shape lever is worth learning.
 
 **UPDATE (Phase 13): the aspect head IS trained end-to-end now.**
-`policy_net.aspect_head` (`Linear→5`) is BC-trained in `train_fast.py` against
+`policy_net.aspect_head` (`Linear→5`) is BC-trained in `train_network.py` against
 `ar_utils.gt_aspect_bucket(gw, gh)` labels with `aspect_weight=0.5`
 (`aspect_acc ~0.47` vs 0.20 chance); shipped in `phase13_aspect.pt`.
 `rl_skyline_optimizer._rl_centers` calls `policy.act_aspect()` per free block and
@@ -861,7 +861,7 @@ doesn't justify the runtime, especially given leaderboard runtime uncertainty.
 Revisited the **network side** (every prior Phase-15 win was legalize-side). Two
 BC-objective changes were hypothesised to attack `HPWL_gap` / free model capacity:
 
-1. **Wirelength-aux loss** (`--wl-weight`, code already in `train_fast.py:236-246`):
+1. **Wirelength-aux loss** (`--wl-weight`, code already in `train_network.py:236-246`):
    soft-argmax the predicted cell distribution to an expected `(col,row)`, pull it
    toward each b2b neighbour's GT cell (weighted Manhattan, in cell units). A
    differentiable "place connected blocks near each other" term the per-cell CE
@@ -875,7 +875,7 @@ All runs are **from scratch, 20k samples**, same config as phase13 otherwise; ev
 through the *current default* legalizer (FREE_CLUSTER/OBS_XCAND/real-cost gate all on).
 A new `ASPECT_PASS` env var (`rl_skyline_optimizer.py`) lets the eval harness — which
 only passes `verbose` — disable the aspect head for checkpoints trained without it
-(an untrained head otherwise picks garbage ratios). `train_fast.py` also gained
+(an untrained head otherwise picks garbage ratios). `train_network.py` also gained
 `--milestone-every` (numbered non-overwriting snapshots, e.g. `_50k.pt`) and a
 `_best.pt` save (lowest windowed total train-loss).
 
@@ -927,6 +927,138 @@ the BC + auxiliary-loss network lever is exhausted at the 20k scale.** The prope
 aligned next step is RL fine-tune with **post-legalize** contest cost as the reward
 (BC's target is two layers removed from the score; wl-aux only adds a proxy term that
 still can't see the legalizer). See `README.md` priority list.
+
+### RL pre-flight diagnostics — Step 0 leverage + best-of-K + K-sweep
+
+Before building an RL loop, two cheap diagnostics de-risked it (the reward used
+throughout is the **runtime-free** contest cost: `evaluate_solution` with
+`runtime=1.0, median_runtime=1.0` → `runtime_adjustment=1.0`, i.e.
+`(1+0.5(hpwl_gap+area_gap))·e^{2V}`, no `RuntimeFactor`).
+
+**Correction to a stale premise.** README priority #2 claimed Phase 12's PPO failed
+because its reward scored the *raw, un-legalized* overlapping layout. `archive/train_ppo.py`
+shows this is **false**: Phase 12 already used `reward = −(legalized cost)`, KL-anchor,
+per-case baseline, frozen GNN, held-out eval — and still failed. What was genuinely
+different/weaker then: (a) the reward legalized through the **old plain `skyline_legalize`**
+(pre-Phase-15, ~1.85), not today's shaped+cohesion+gate chain (1.60); (b) cost was
+`compute_training_loss_differentiable` (soft overlap, floor 1.0, GT-normalized), not the
+real contest cost; (c) it warm-started from phase11 and the **aspect head never
+participated** in the RL action. So "RL with post-legalize reward + KL" is not new — the
+new bet is the far stronger legalizer + real cost + aspect-in-action + phase13 start.
+
+**Step 0 — leverage (`poc_rl_leverage.py`).** The one question that decides whether
+RL-on-centers can work: given today's strong legalizer (which re-packs aggressively —
+"Area_gap is downstream of how skyline packs, not where the model predicts"), how much
+does final cost actually depend on the rollout's centers? Method: greedy rollout +
+K=16 sampled rollouts per case, each fed through the *full current* `solve(centers_override=…)`
+pipeline, scored by the runtime-free contest cost. Measure `greedy − best-of-K`.
+
+| Case band | mean greedy | mean best-of-16 | ceiling (greedy−bestK) | cases bestK<greedy |
+|---|---|---|---|---|
+| small (bc 21–40) | 1.8072 | 1.6379 | **0.169** | 18/20 |
+| large (bc 101–120) | 1.6265 | 1.5750 | **0.052** | 14/20 |
+
+Headroom is **real but shrinks on large cases** (dense → more legalizer-determined; 6/20
+large cases have negative gap — greedy already beats all samples). Crucially the Total
+Score is `e^{n/12}`-weighted toward large cases, so the **weighted** ceiling over these 40
+cases is only **0.029** (≈ the large-case value; small-case headroom is weighted to near-
+irrelevance). Verdict: not a dead end (positive everywhere in aggregate), but the
+weighted upside is modest — exactly the kind of thing that's easy to over-invest in.
+
+**best-of-K inference (`RL_NSAMPLE`, full 100).** best-of-K > greedy means the greedy
+argmax is *not* the policy's best output. So a zero-training capture: run K rollouts
+(candidate 0 greedy + K−1 sampled), legalize each, keep the lowest real cost via the
+**candidate-relative gate** (`_best_of_k_solve` → `_gate_real_cost`, min-baseline, no GT,
+inference-valid — never worse than greedy by construction). Full 100-case sweep:
+
+| K | Total Score (quality) | Avg Cost | Avg Runtime | Δquality vs K=1 | runtime× |
+|---|---|---|---|---|---|
+| 1 (greedy) | 1.6039 | 1.6847 | 0.83s | — | 1.0× |
+| 2 | 1.5956 | 1.6564 | 1.39s | −0.52% | 1.67× |
+| 4 | 1.5748 | 1.6198 | 3.07s | −1.81% | 3.70× |
+| 8 | **1.5623** | 1.5886 | 5.54s | **−2.59%** | 6.67× |
+
+Quality beats the 0.029 ceiling estimate (mid cases 41–79 add headroom): **1.6039 →
+1.5623 (−2.6%)**, all feasible. **But the official `runtime^0.3` term likely eats it.**
+Break-even: if our runtime is above the `max(0.7,·)` floor (RF>0.30×median), the penalty
+grows as `(rt_K/rt_1)^0.3` — K=2 alone is `1.675^0.3=1.174` (+17%), dwarfing the 0.52%
+quality gain. best-of-K is only "free" if it stays under the floor, requiring field
+median runtime **>4.6s (K=2) / >18.5s (K=8)** per case — implausible for ~0.5–1s analytic
+solvers. (Locally RuntimeFactor is pinned to 1.0, so locally best-of-8 genuinely scores
+1.5623; the trade-off bites only on the official leaderboard.)
+
+**Net: best-of-K is not a safe shippable stopgap, but it pins a real, capturable quality
+target (~1.56) and proves RL has a worthwhile objective.** RL is the runtime-free vehicle:
+bake the best-of-K improvement into the weights so **greedy (1×, 0.83s)** reaches ~1.56.
+This justifies building the RL fine-tune (warm-start phase13, reward = runtime-free
+contest cost on the full current pipeline, aspect head in the action, KL-anchor +
+per-case baseline retained from Phase 12, held-out eval on real Total Score).
+
+### Phase 17 — RL fine-tune (`train_rl_finetune.py`): method, vs BC rollout, result
+
+This is the first RL *training* that actually ships through the strong legalizer and
+the real cost (Phase 4 and Phase 12 RL attempts predate both and were abandoned). It
+**fine-tunes the phase13 BC policy** — same GNN+CNN+heads, same greedy-rollout inference;
+only the *weights* change.
+
+**Naming clarity (important).** "RL" across this repo (`rl_skyline_optimizer.py`, "RL
+rollout", "RL centers") names the *architecture* — a sequential MDP placer (policy/value
+net, rollout through `PlacementEnv`). It is **not** the training method: every shipped
+checkpoint (phase11, phase13) was trained by **behaviour cloning (BC)**, not RL. "RL
+rollout" = running that policy through the MDP at inference; a BC-trained policy rolls out
+identically. Phase 17 is the first time the *training* is actually RL.
+
+**How the two training methods differ (inference path is identical):**
+
+| | BC rollout (phase13, `train_network.py`) | RL fine-tune (phase17, `train_rl_finetune.py`) |
+|---|---|---|
+| Training signal | GT cell label (imitate the dataset's placement) | **real post-legalize contest cost** of the rollout |
+| Objective | per-block cross-entropy to GT cell (+ aspect CE) | PPO policy-gradient: raise P(actions that lowered cost) |
+| Sees the legalizer? | **No** — never legalizes, never sees cost | **Yes** — reward = full `solve()` (shaped+cohesion+gate) |
+| Credit assignment | each block scored independently vs its GT cell | terminal reward over the whole episode (per-case baseline) |
+| Exploration | none (copy GT) | stochastic rollouts (position **and** aspect sampled) |
+| Data used | GT labels — saturates by ~10k (capacity/objective ceiling) | self-generated; 1M instances act as RL *environments* |
+| Stabilizers | soft labels (σ=1.5) | KL-anchor to BC policy, per-case advantage, frozen GNN |
+| Reward shape (no runtime) | — | `−(1+0.5(hpwl_gap+area_gap))·e^{2V}`, runtime=1.0 |
+
+The reward is computed by literally calling `RLSkylineOptimizer.solve(centers_override=…)`
+— so the policy is rewarded for centers that legalize well through *exactly* the inference
+pipeline. Advantage is per-case normalized `(−cost − mean)/std` over K rollouts of the
+same case (std floored at 0.1), so cases of wildly different HPWL scale (gt_hpwl 4→1357)
+don't need cross-case comparability. Held-out eval runs greedy rollouts on a 12-case
+validation spread (the scored set), tracked every 5 iters.
+
+**Result (40 iters, batch 8 × rollouts 8, lr 3e-5, kl 0.1, full 100-case `--evaluate`):**
+
+| | Total Score | Avg Cost | Feasible | Runtime |
+|---|---|---|---|---|
+| phase13_aspect (BC, baseline) | **1.6039** | 1.6847 | 100/100 | 0.83s |
+| **phase17_rl (RL fine-tune)** | 1.6271 | 1.7107 | 100/100 | **0.66s** |
+
+The held-out 12-case proxy oscillated (1.66–1.77, no clean descent; KL stayed ~0.005 so
+the policy did *not* diverge — unlike Phase 12). On the real weighted score RL **did not
+beat BC: 1.6039 → 1.6271 (+1.4% quality).** But it is **not a dead loss and is kept as a
+comparison point**: it is 100/100 feasible and its greedy runtime is **0.66s vs 0.83s** —
+faster (the RL-tuned centers legalize with fewer reshape-gate candidates). Since
+`runtime^0.3` is officially scored, a quality-flat-but-faster checkpoint is not strictly
+dominated; whether it nets better officially depends on the field median.
+
+**Why quality didn't improve (the diagnostics predicted it):**
+1. **The weighted ceiling was only ~0.029** (Step 0). RL captures a fraction of an already
+   small target; with a noisy 8-case/iter signal it barely moves, and small drift the
+   wrong way nets negative.
+2. **Objective–metric weighting mismatch.** RL optimizes the *unweighted* average over 1M
+   training cases, but Total Score is `e^{n/12}`-weighted toward large cases — which have
+   the *least* center headroom (large-case ceiling 0.029 vs small 0.169). So RL improves
+   the wrong-weighted quantity.
+3. Saved checkpoint is the *last* iter (39), not the proxy-best (iter 4/14); but the proxy
+   gains were tiny and noisy, so a best-by-proxy save would likely still be ~flat weighted.
+
+**Untried variant with possible upside:** align RL with the score — sample large cases more
+often, or weight advantages by `e^{n/12}`. Bounded by the 0.029 large-case ceiling, so
+low-confidence. **Standing conclusion across Phase 4/12/17: the legalizer has absorbed the
+center structure; the policy/centers RL lever can't beat BC+strong-legalizer (1.6039). The
+remaining real lever is legalizer-side**, which delivered every Phase 15 win (1.85→1.60).
 
 ---
 

@@ -15,10 +15,10 @@ from pathlib import Path
 
 import torch
 
-_FLOORSET_ROOT = Path(__file__).resolve().parent.parent.parent
+_FLOORSET_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_FLOORSET_ROOT) not in sys.path:
     sys.path.insert(0, str(_FLOORSET_ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lite_dataset_test import FloorplanDatasetLiteTest  # noqa: E402
 from placement_env import PlacementEnv  # noqa: E402

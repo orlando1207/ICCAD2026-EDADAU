@@ -43,13 +43,13 @@ if str(_DL_DIR) not in sys.path:
 
 from iccad2026_evaluate import FloorplanOptimizer  # noqa: E402
 
-from analytic_legalizer.constraints import (  # noqa: E402
+from legalizer.constraints import (  # noqa: E402
     parse_and_init, prepack_clusters, slide_boundary, enforce_hard,
 )
-from analytic_legalizer.skyline_legalizer import (  # noqa: E402
+from legalizer.skyline_legalizer import (  # noqa: E402
     skyline_legalize, _detailed_place,
 )
-from analytic_legalizer.quadratic_placer import analytic_place  # noqa: E402
+from legalizer.quadratic_placer import analytic_place  # noqa: E402
 from ar_utils import ASPECT_BUCKETS  # noqa: E402
 
 _DEFAULT_CKPT = _DL_DIR / "checkpoints" / "phase13_aspect.pt"
@@ -117,9 +117,10 @@ class RLSkylineOptimizer(FloorplanOptimizer):
                               f"falling back to quadratic centers")
 
     def _rl_centers(self, area_targets, b2b, p2b, pins, constraints,
-                    target_positions, block_count
+                    target_positions, block_count, greedy: bool = True
                     ) -> Optional[Tuple[np.ndarray, np.ndarray, Dict[int, float]]]:
-        """Greedy RL rollout -> per-block (cx, cy) + (if `aspect_pass`) a
+        """Greedy (or, with greedy=False, sampled) RL rollout -> per-block (cx, cy)
+        + (if `aspect_pass`) a
         predicted aspect ratio (w/h) for "free" blocks (no fixed/MIB/cluster
         shape constraint). None if no model loaded."""
         if self._model is None:
@@ -144,11 +145,11 @@ class RLSkylineOptimizer(FloorplanOptimizer):
             is_free = (self.aspect_pass and cur not in env.fixed_dims
                        and cur not in env.mib_dims and int(constraints[cur, 3]) == 0)
             if is_free:
-                a, aspect_idx, _lp, _v = policy.act_aspect(canvas, node_emb[cur], mask, greedy=True)
+                a, aspect_idx, _lp, _v = policy.act_aspect(canvas, node_emb[cur], mask, greedy=greedy)
                 aspect = ASPECT_BUCKETS[aspect_idx]
                 aspect_choice[cur] = aspect
             else:
-                a, _lp, _v = policy.act(canvas, node_emb[cur], mask, greedy=True)
+                a, _lp, _v = policy.act(canvas, node_emb[cur], mask, greedy=greedy)
                 aspect = 1.0
             _s, _r, done, _i = env.step(a, aspect=aspect)
 
@@ -176,7 +177,7 @@ class RLSkylineOptimizer(FloorplanOptimizer):
     def _proxy(pos, b2b, p2b, pins) -> float:
         """bbox_area · raw_HPWL — the same quality drivers the contest cost uses
         (lower is better). Used to keep B2 only when it beats B1."""
-        from analytic_legalizer.skyline_legalizer import _raw_hpwl
+        from legalizer.skyline_legalizer import _raw_hpwl
         xs = [p[0] for p in pos]; ys = [p[1] for p in pos]
         x2 = max(p[0] + p[2] for p in pos); y2 = max(p[1] + p[3] for p in pos)
         bbox = (x2 - min(xs)) * (y2 - min(ys))
@@ -225,6 +226,27 @@ class RLSkylineOptimizer(FloorplanOptimizer):
             return pos_b2
         return pos_b1
 
+    def _best_of_k_solve(self, K, block_count, area_targets, b2b, p2b, pins,
+                         constraints, target_positions):
+        """K rollouts (candidate 0 greedy, rest sampled) -> legalize each via the
+        full solve() pipeline -> select the lowest real cost with the candidate-
+        relative gate. Never worse than the greedy default (it is candidate 0)."""
+        cands = []
+        for k in range(K):
+            centers = self._rl_centers(
+                area_targets, b2b, p2b, pins, constraints,
+                target_positions, block_count, greedy=(k == 0))
+            if centers is None:                      # no model -> plain greedy path
+                return self.solve(block_count, area_targets, b2b, p2b, pins,
+                                  constraints, target_positions)
+            cands.append(self.solve(
+                block_count, area_targets, b2b, p2b, pins, constraints,
+                target_positions, centers_override=centers))
+        if len(cands) == 1:
+            return cands[0]
+        return self._gate_real_cost(cands, constraints, b2b, p2b, pins,
+                                    area_targets, target_positions)
+
     def solve(
         self,
         block_count: int,
@@ -236,6 +258,20 @@ class RLSkylineOptimizer(FloorplanOptimizer):
         target_positions: torch.Tensor = None,
         centers_override: Optional[Tuple] = None,
     ) -> List[Tuple[float, float, float, float]]:
+
+        # Best-of-K inference (RL_NSAMPLE>1): the policy's greedy argmax is not its
+        # best output (poc_rl_leverage.py: K sampled rollouts beat greedy by ~0.03
+        # weighted). Run K rollouts (1 greedy + K-1 sampled), legalize each through
+        # the full pipeline, and keep the lowest real cost — selection uses the same
+        # candidate-relative gate as reshape variants (no GT, inference-valid). Costs
+        # K× runtime (runtime^0.3 is scored officially — watch the trade-off).
+        import os
+        K = int(os.environ.get("RL_NSAMPLE", "1"))
+        if (K > 1 and centers_override is None and self.center_source == "model"
+                and self._model is not None):
+            return self._best_of_k_solve(
+                K, block_count, area_targets, b2b_connectivity,
+                p2b_connectivity, pins_pos, constraints, target_positions)
 
         blocks, mib_groups, cluster_groups = parse_and_init(
             block_count, area_targets, constraints, target_positions
@@ -291,7 +327,7 @@ class RLSkylineOptimizer(FloorplanOptimizer):
                     b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
                 )
             if self.compact_pass:                   # squeeze residual whitespace
-                from analytic_legalizer.topology import compact
+                from legalizer.topology import compact
                 p = compact(p, blocks, sb, cg)
             return p
 

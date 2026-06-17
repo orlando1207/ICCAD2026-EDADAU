@@ -24,7 +24,7 @@ so old `phase8_bc.pt` checkpoints are NOT compatible — retrain here.
 
 Run:
     cd FloorSet/iccad2026contest
-    python3 CNN_RL/train_fast.py --num-samples 20000 --epochs 1 --grid 64 --workers 12
+    python3 CNN_RL/train_network.py --num-samples 20000 --epochs 1 --grid 64 --workers 12
 """
 
 from __future__ import annotations
@@ -176,14 +176,14 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
         _init_ck = torch.load(init_ckpt, map_location=device)
         gnn.load_state_dict(_init_ck["gnn"])
         policy.load_state_dict(_init_ck["policy"])
-        print(f"[train_fast] resumed weights from {init_ckpt}")
+        print(f"[train_network] resumed weights from {init_ckpt}")
     opt = torch.optim.Adam(list(gnn.parameters()) + list(policy.parameters()), lr=lr)
     if _init_ck is not None and "opt" in _init_ck:
         opt.load_state_dict(_init_ck["opt"])
         # override stored LR with the requested LR (allow fine-tuning at different LR)
         for pg in opt.param_groups:
             pg["lr"] = lr
-        print(f"[train_fast] restored optimizer state (lr overridden to {lr})")
+        print(f"[train_network] restored optimizer state (lr overridden to {lr})")
 
     ds = BCEpisodeDataset(root, grid=grid, num_samples=num_samples, start_idx=start_idx)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=workers,
@@ -191,7 +191,7 @@ def train(num_samples=20000, epochs=1, grid=64, gnn_out=128, hidden=64,
                         persistent_workers=(workers > 0),
                         prefetch_factor=(4 if workers > 0 else None))
     mode = f"soft(sigma={soft_sigma})" if soft_sigma > 0 else "hard(cross-entropy)"
-    print(f"[train_fast] device={device} workers={workers} "
+    print(f"[train_network] device={device} workers={workers} "
           f"samples={len(ds)} x {epochs} epoch(s) grid={grid} accum={accum} loss={mode}")
 
     # Grid-cell index buffers for the wirelength-aux soft-argmax (expected col/row).

@@ -1,11 +1,38 @@
 # CNN_RL — GNN + CNN + RL Sequential Placer (ICCAD 2026 Contest C)
 
-Independent, learned alternative to `analytic_legalizer/`'s deterministic
-pipeline: a GNN+CNN policy picks placement centers, which are then run through
-`analytic_legalizer`'s own legalization chain. **Does not modify
-`analytic_legalizer/`** — only imports its pure functions (`skyline_legalize`,
-`parse_and_init`, `prepack_clusters`, `slide_boundary`, `enforce_hard`,
-`_detailed_place`).
+Self-contained, learned alternative to a deterministic legalizer: a GNN+CNN policy
+picks placement centers, which are then run through a skyline legalization chain.
+
+**Zero external dependency on `analytic_legalizer/`.** The legalizer's pure functions
+(`skyline_legalize`, `parse_and_init`, `prepack_clusters`, `slide_boundary`,
+`enforce_hard`, `_detailed_place`, plus `quadratic_placer`/`topology`) are **vendored**
+into [`CNN_RL/legalizer/`](legalizer/) (byte-for-byte copies at vendor time). Everything
+this package needs lives under `CNN_RL/`, so it can be merged/moved without colliding with
+changes to the external `analytic_legalizer/` tree. The only remaining out-of-package
+import is the contest harness `iccad2026_evaluate.py` (the scoring entry point).
+
+## Placement methods — greedy vs RL/best-of-K (both worth using)
+
+At inference the trained policy is rolled out through `PlacementEnv` to produce per-block
+centers. There are two ways to turn the policy into a final layout, **both useful**:
+
+| Method | How | Total Score | Runtime | When to use |
+|---|---|---|---|---|
+| **Greedy** (default) | argmax each cell, one rollout | **1.6039** | 0.83s | submission default — best quality/runtime balance |
+| **best-of-K** (`RL_NSAMPLE=K`) | K sampled rollouts, keep lowest real cost (candidate-relative gate, no GT) | 1.5623 (K=8) | 5.54s (K=8) | when runtime budget is loose and quality is paramount; K× runtime |
+
+- **Greedy** is the submission default: one deterministic rollout → legalize. Fast, and on
+  large cases (which dominate the `e^{n/12}`-weighted Total Score) it is already near the
+  per-policy ceiling.
+- **best-of-K** exploits that the greedy argmax is *not* the policy's best output: sampling
+  K rollouts and keeping the lowest real post-legalize cost reaches ~1.56 (the measured
+  upper bound of this center-prediction method) — but costs K× runtime, which `runtime^0.3`
+  likely eats officially. Toggle with `RL_NSAMPLE=8` (see "Quick start").
+
+Both are the *same policy*; they differ only in how many rollouts are scored. An RL
+fine-tuned checkpoint (`train_rl_finetune.py`, `phase17_rl.pt`) aims to fold the best-of-K
+gain into greedy — runtime-competitive (0.66s) but quality not yet beating BC; see
+`ALGORITHM.md` §"Phase 17".
 
 ## TL;DR — current status
 
@@ -71,6 +98,17 @@ python3 iccad2026_evaluate.py --evaluate CNN_RL/rl_skyline_optimizer.py
 
 Add `--test-id 0 --verbose` to debug a single case.
 
+**best-of-K inference** (higher quality, K× runtime) — keep the lowest real cost over K
+sampled rollouts:
+
+```bash
+RL_NSAMPLE=8 python3 iccad2026_evaluate.py --evaluate CNN_RL/rl_skyline_optimizer.py
+```
+
+`RL_NSAMPLE=1` (unset) is the greedy default. Other env toggles: `ASPECT_PASS=0` disables
+the aspect head (for checkpoints trained without it), `RL_CKPT=<path>` overrides the
+checkpoint.
+
 ### Visualize a placement
 
 ```bash
@@ -82,7 +120,7 @@ python3 CNN_RL/plot_compare.py --test-id 0 --out CNN_RL/compare_case0.png
 ### Dataset (required for training)
 
 Training uses the **FloorSet-Lite** dataset (~6 GB download, ~24 GB extracted).
-`train_fast.py` calls `FloorplanDatasetLite` which **auto-downloads** the archive
+`train_network.py` calls `FloorplanDatasetLite` which **auto-downloads** the archive
 from HuggingFace on the first run if it is not already present:
 
 ```
@@ -96,12 +134,12 @@ download (~10–30 min depending on connection speed).
 
 ### Train from scratch
 
-One script, `train_fast.py` — vectorised rasterizer + batched GNN/CNN forward
+One script, `train_network.py` — vectorised rasterizer + batched GNN/CNN forward
 + parallel `DataLoader` workers (~10+ samples/s on a 12-core + GPU box):
 
 ```bash
 # Run from FloorSet/iccad2026contest/
-python3 CNN_RL/train_fast.py \
+python3 CNN_RL/train_network.py \
     --num-samples 20000 --epochs 1 --grid 64 --workers 16 \
     --soft-sigma 1.5 --aspect-weight 0.5 --ckpt-name phase13_aspect.pt
 ```
@@ -127,7 +165,7 @@ The full dataset has 1,008,000 samples; a 20k run only ever sees indices
 `[0, 20000)`. To keep training on fresh data:
 
 ```bash
-python3 CNN_RL/train_fast.py \
+python3 CNN_RL/train_network.py \
     --num-samples 20000 --start-idx 20000 \
     --epochs 1 --grid 64 --workers 16 \
     --soft-sigma 1.5 --aspect-weight 0.5 \
@@ -155,12 +193,12 @@ Each `test_*.py` is a standalone acceptance test for the module of the same
 name:
 
 ```bash
-python3 CNN_RL/test_placement_env.py
-python3 CNN_RL/test_canvas_raster.py
-python3 CNN_RL/test_gnn_encoder.py
-python3 CNN_RL/test_policy_net.py
-python3 CNN_RL/test_pretrain_bc.py
-python3 CNN_RL/test_hard_constraints.py
+python3 CNN_RL/test/test_placement_env.py
+python3 CNN_RL/test/test_canvas_raster.py
+python3 CNN_RL/test/test_gnn_encoder.py
+python3 CNN_RL/test/test_policy_net.py
+python3 CNN_RL/test/test_pretrain_bc.py
+python3 CNN_RL/test/test_hard_constraints.py
 ```
 
 ## Repo layout
@@ -168,30 +206,40 @@ python3 CNN_RL/test_hard_constraints.py
 ```
 CNN_RL/
 ├── rl_skyline_optimizer.py           # main FloorplanOptimizer (current best, submit this)
+│                                     #   greedy default; RL_NSAMPLE=K -> best-of-K; ASPECT_PASS toggle
 ├── rl_skyline_optimizer_compact.py   # + whitespace-compaction pass (experiment, currently a net loss)
 ├── rl_skyline_optimizer_quad_ablation.py  # sanity check: quadratic-placer centers
 │                                           #   through the same legalizer chain
-├── train_fast.py                     # training entrypoint (BC, vectorised + parallel)
-├── placement_env.py                  # RL environment (reset/step/reward)
+├── legalizer/                        # ** VENDORED legalizer — no analytic_legalizer/ dependency **
+│   ├── constraints.py                #   parse_and_init / prepack_clusters / slide_boundary / enforce_hard
+│   ├── skyline_legalizer.py          #   skyline_legalize / _detailed_place / Skyline helpers
+│   ├── quadratic_placer.py           #   analytic_place (quadratic-centers fallback/ablation)
+│   └── topology.py                   #   build_topology / longest_path_pack / compact
+├── train_network.py                  # BC training entrypoint (vectorised + parallel)  [was train_fast.py]
+├── train_rl_finetune.py              # Phase 17 RL fine-tune (PPO + KL-anchor on real legalized cost)
+├── placement_env.py                  # RL/MDP environment (reset/step/reward)
 ├── canvas_raster.py                  # partial placement -> [5,G,G] raster
 ├── gnn_encoder.py                    # netlist -> node embeddings (SAGE-style)
-├── policy_net.py                     # CNN trunk + policy/value heads
+├── policy_net.py                     # CNN trunk + policy/value/aspect heads
 ├── ar_utils.py                       # aspect-ratio bucket utilities (Phase 5/13)
 ├── skyline_shape.py                  # Phase 15/B1 contour-aware in-packer shaping (skyline_legalize_shaped)
 ├── topo_shape.py                     # Phase 15/B2 critical-path slack shaping (legalize_b2, off by default)
 ├── poc_slack_shaping.py              # Phase 15 PoC: measures the Area_gap ceiling of block reshaping
-├── pretrain_bc.py / train_phase8.py  # utility modules imported by train_fast.py
+├── poc_rl_leverage.py                # RL leverage diagnostic (greedy vs best-of-K spread)
+├── pretrain_bc.py / train_phase8.py  # utility modules imported by train_network.py
 ├── hard_constraints.py               # hard-constraint snapping used by placement_env.py
-├── plot_rl_skyline.py / plot_compare.py  # visualization helpers
-├── test_*.py                         # one acceptance test per active module
+├── plot_rl_skyline.py / plot_compare.py  # visualization helpers (--no-wires hides connections)
+├── test/                             # acceptance tests (not needed to retrain; kept out of the way)
+│   └── test_*.py                     #   one per active module
 ├── checkpoints/phase13_aspect.pt     # current default checkpoint (Phase 13, 20k samples, aspect-ratio head)
-├── checkpoints/phase14_aspect_100k.pt  # Phase 14 continuation (100k samples total) — net loss, not default
+├── checkpoints/phase17_rl.pt         # Phase 17 RL fine-tune (comparison point; faster, quality ~flat)
 ├── ALGORITHM.md                      # full phase-by-phase history & lessons
+├── presentation.md                   # consolidated report (architecture + experiments + results)
 └── archive/                          # deprecated/abandoned, kept for reference
     ├── rl_optimizer.py               # Phase 7/8 (Total Score 10.05 / 15.60)
     ├── train_ppo.py                  # Phase 12 PPO+KL-anchor (abandoned)
     ├── test_ar_utils.py              # Phase 5 acceptance test for the aspect-ratio head
-    ├── train_rl.py / test_train_rl.py     # Phase 4 PPO loop, superseded by train_fast.py
+    ├── train_rl.py / test_train_rl.py     # Phase 4 PPO loop, superseded by train_network.py
     ├── checkpoints/                  # old/intermediate checkpoints incl. phase11_pin_soft.pt
     └── HANDOFF.md, VERSION_B_RL_PLACER.md  # superseded planning docs
 ```
@@ -205,7 +253,7 @@ GNN encodes the netlist (who connects to whom)        <- "graph" half
   + the partial placement is rasterized to a grid      <- "vision" half
   + a CNN reads that grid
   + greedy policy picks where to drop each block, one at a time
-  + per-block centers (cx,cy) -> analytic_legalizer.skyline_legalize()
+  + per-block centers (cx,cy) -> legalizer.skyline_legalize()   (vendored, CNN_RL/legalizer/)
   + slide_boundary -> enforce_hard -> _detailed_place
 ```
 
@@ -234,8 +282,8 @@ b2b wirelength-pull, feasibility mask, **pin-pull** (p2b HPWL field, Phase 11).
 2. `canvas_raster.py` — partial placement -> `[5,G,G]` raster
 3. `gnn_encoder.py` — pure-PyTorch SAGE-style message passing, `[N,10] -> [N,D]`
 4. `policy_net.py` — CNN trunk + policy/value heads, masked softmax over `[G,G]`
-5. `train_fast.py` — batched behaviour-cloning vs. GT placements (soft-label CE)
-6. `rl_skyline_optimizer.py` — greedy rollout -> centers -> `analytic_legalizer`
+5. `train_network.py` — batched behaviour-cloning vs. GT placements (soft-label CE)
+6. `rl_skyline_optimizer.py` — greedy rollout -> centers -> vendored `legalizer/`
    skyline chain -> `FloorplanOptimizer.solve()`
 
 ### Results progression (quality-only avg cost, lower is better)

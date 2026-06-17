@@ -27,8 +27,8 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Tuple
 
-from analytic_legalizer.topology import build_topology, longest_path_pack, compact
-from analytic_legalizer.constraints import (
+from legalizer.topology import build_topology, longest_path_pack, compact
+from legalizer.constraints import (
     BlockInfo, SuperBlock,
     BOUND_LEFT, BOUND_RIGHT, BOUND_TOP, BOUND_BOTTOM,
 )

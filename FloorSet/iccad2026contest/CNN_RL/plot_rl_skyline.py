@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--center-source", choices=["model", "quadratic"], default="model")
     ap.add_argument("--ground-truth", action="store_true",
                      help="Plot the dataset ground-truth layout instead of the optimizer output")
+    ap.add_argument("--no-wires", action="store_true",
+                     help="Hide b2b/p2b connection lines (blocks + pins only)")
     args = ap.parse_args()
 
     dataset = FloorplanDatasetLiteTest(str(_CONTEST_DIR) + "/")
@@ -83,10 +85,17 @@ def main():
     # visualize_lite expects fp_sol elements as (w, h, x, y)
     fp_sol = [(w, h, x, y) for (x, y, w, h) in positions]
 
+    # --no-wires: feed empty connectivity so visualize_lite's b2b/p2b plot loops
+    # are no-ops (blocks + pin dots still drawn).
+    b2b_plot, p2b_plot = b2b_conn, p2b_conn
+    if args.no_wires:
+        b2b_plot = torch.empty((0, b2b_conn.shape[1]), dtype=b2b_conn.dtype)
+        p2b_plot = torch.empty((0, p2b_conn.shape[1]), dtype=p2b_conn.dtype)
+
     visualize_lite(
         fp_sol,
-        b2b_conn,
-        p2b_conn,
+        b2b_plot,
+        p2b_plot,
         pins_pos,
         constraints,
         lind=args.test_id,
