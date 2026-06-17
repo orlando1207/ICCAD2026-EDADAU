@@ -9,6 +9,7 @@ Output `Compiled`:
   - per-unit redistribution edge lists for the wirelength slack pass
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
@@ -253,3 +254,61 @@ def expand(comp: Compiled, ux: np.ndarray, uy: np.ndarray):
     bx = ux[comp.block_unit] + comp.offx
     by = uy[comp.block_unit] + comp.offy
     return bx, by, comp.bw, comp.bh
+
+
+def dims_from_areas(n, area_targets, constraints, target_positions=None, aspect=1.0):
+    """Derive (dims_wh [n,2], pre_xy [n,2]) from area targets + hard constraints.
+
+    Uses target_positions ONLY for fixed-shape/preplaced blocks (hard constraints).
+    Free blocks: w = sqrt(area * aspect), h = sqrt(area / aspect). aspect=1 → square.
+    MIB groups: all members get the same dims (first non-preplaced member is the ref).
+    """
+    area = _to_np(area_targets).astype(float)[:n]
+    C = _to_np(constraints)
+    ncol = C.shape[1] if C.ndim > 1 else 0
+    fixed_f = C[:, 0] if ncol > 0 else np.zeros(n)
+    prep_f  = C[:, 1] if ncol > 1 else np.zeros(n)
+    mib_id  = (C[:, 2] if ncol > 2 else np.zeros(n)).astype(int)
+
+    tp = _to_np(target_positions).astype(float) if target_positions is not None else None
+
+    dims_wh = np.zeros((n, 2))
+    pre_xy  = np.full((n, 2), -1.0)
+    asp = max(float(aspect), 1e-4)
+
+    for i in range(n):
+        if tp is not None and prep_f[i] != 0:
+            dims_wh[i] = [tp[i, 2], tp[i, 3]]
+            pre_xy[i]  = [tp[i, 0], tp[i, 1]]
+        elif tp is not None and fixed_f[i] != 0:
+            dims_wh[i] = [tp[i, 2], tp[i, 3]]
+        else:
+            a = max(float(area[i]), 1e-9)
+            dims_wh[i] = [math.sqrt(a * asp), math.sqrt(a / asp)]
+
+    # MIB: uniform dims within each group.
+    # Priority for the reference: fixed-shape or preplaced blocks (hard constraints)
+    # come first; if none exist in the group, use the first free member.
+    # Only free (not fixed, not preplaced) members are overridden.
+    max_mib = int(mib_id.max()) if mib_id.size else 0
+    for g in range(1, max_mib + 1):
+        mem = np.where(mib_id == g)[0]
+        if len(mem) == 0:
+            continue
+        ref = None
+        for i in mem:
+            if prep_f[i] != 0 or fixed_f[i] != 0:
+                ref = dims_wh[i].copy()
+                break
+        if ref is None:
+            for i in mem:
+                if prep_f[i] == 0:
+                    ref = dims_wh[i].copy()
+                    break
+        if ref is None:
+            continue
+        for i in mem:
+            if prep_f[i] == 0 and fixed_f[i] == 0:
+                dims_wh[i] = ref.copy()
+
+    return dims_wh, pre_xy

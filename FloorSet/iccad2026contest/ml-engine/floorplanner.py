@@ -8,13 +8,21 @@ Pipeline (given fixed block dims):
 Guarantees: always returns a geometrically feasible layout (overlap-free,
 preplaced exact). If SA never finds a feasible topology, a constructive floor
 (movable units shelf-packed clear of the preplaced obstacles) is used.
+
+Shape awareness: each SA worker independently optimises block aspect ratios
+(for free singleton units) via 7-discrete-ratio moves. The final shapes are
+synced back to the worker's comp before finalize(), so bx/by/bw/bh returned
+by the worker are always consistent with the actual placed dimensions. The
+parent NEVER calls expand() on the best worker result — it uses the worker's
+already-expanded arrays directly to avoid the shape-mismatch bug.
 """
 
+import math
 import multiprocessing as mp
 
 import numpy as np
 
-from compile_problem import compile_with_targets, expand
+from compile_problem import compile_with_targets, expand, dims_from_areas
 from init_place import initial_sp, _simpl_place
 from packer import pack, build_adj, redistribute
 from anneal import anneal
@@ -58,21 +66,51 @@ def _grouping_from_pos(comp, bx, by, bw, bh):
     return vg
 
 
+def _apply_shape_to_comp(comp, shape_r):
+    """Sync final aspect ratios from anneal() back to comp before finalize().
+
+    shape_r[u] is the final w/h ratio for unit u.  Only free singleton units
+    (rot_ok=True) may differ from the initial 1:1 ratio.  area is preserved:
+      new_w = sqrt(area_u * r),  new_h = sqrt(area_u / r)
+    where area_u = comp.uw[u] * comp.uh[u] (original, unmodified by SA).
+    """
+    area_u = comp.uw * comp.uh   # comp was NOT modified by anneal (A is a copy)
+    changed = False
+    for u in range(comp.U):
+        if not comp.rot_ok[u] or len(comp.members[u]) != 1:
+            continue
+        r = float(shape_r[u])
+        new_w = math.sqrt(max(area_u[u] * r, 1e-12))
+        new_h = math.sqrt(max(area_u[u] / r, 1e-12))
+        if abs(new_w - comp.uw[u]) > 1e-9:
+            comp.uw[u] = new_w; comp.uh[u] = new_h
+            b = comp.members[u][0][0]
+            comp.bw[b] = new_w; comp.bh[b] = new_h
+            changed = True
+    if changed:
+        comp.build_redistribution()
+
+
 def _anneal_worker(args):
-    """Seed (shelf-pack@W* for compact area, or spread for low HPWL), anneal under
-    the outline penalty, finalize, and return the TRUE final cost. Multistart mixes
-    both seed types and selects the winner per case."""
-    comp, budget, seed, outline, method = args
+    """Seed, anneal, finalize; return (cost, bx, by, ok, bw, bh) 6-tuple.
+
+    bw/bh reflect the worker's final block shapes (possibly reshaped vs. the
+    parent's original comp).  The parent must NOT call expand(comp,...) on the
+    selected result; it uses bx/by/bw/bh directly.
+    """
+    comp, budget, seed, outline, method, enable_rotation = args
     P0, N0 = initial_sp(comp, outline=outline, method=method)
-    bP, bN, _, feas = anneal(comp, P0, N0, time_budget=budget, seed=seed,
-                             outline=outline)
+    bP, bN, _, feas, shape_r = anneal(
+        comp, P0, N0, time_budget=budget, seed=seed,
+        outline=outline, enable_rotation=enable_rotation)
+    _apply_shape_to_comp(comp, shape_r)   # sync final shapes to comp
     ux, uy, res = finalize(comp, bP, bN)
     bx, by, bw, bh = expand(comp, ux, uy)
     ok = (res < 1e-6) and count_overlaps(bx, by, bw, bh) == 0
     vg = _grouping_from_pos(comp, bx, by, bw, bh)
     sc = score_layout(bx, by, bw, bh, comp.nets, comp.codes, comp.n_soft,
                       comp.hpwl_base, comp.area_base, v_group=vg)
-    return (sc.cost, ux, uy, ok)
+    return (sc.cost, bx.copy(), by.copy(), ok, bw.copy(), bh.copy())
 
 
 def _inv_posn(N, U):
@@ -82,11 +120,8 @@ def _inv_posn(N, U):
 
 
 def _candidate_outlines(comp, area_star, k):
-    """Target boxes (W*, H*) with W*.H* = area_star, using preplaced as a lower
-    bound on the box and boundary+preplaced to pin a dimension when present.
-    Returns up to k candidates (aspect sweep over the feasible range)."""
+    """Target boxes (W*, H*) with W*.H* ≈ area_star, swept over feasible aspects."""
     A = max(area_star, 1e-9)
-    # preplaced lower bounds (absolute coords) and boundary pins
     w_lo = h_lo = 0.0
     w_pin = h_pin = 0.0
     for u in range(comp.U):
@@ -106,16 +141,14 @@ def _candidate_outlines(comp, area_star, k):
         cands.append((w_pin, A / w_pin))
     if h_pin > 0 and h_pin * h_pin <= A * 1.0001:
         cands.append((A / h_pin, h_pin))
-    # aspect sweep r = W/H within the range allowed by the lower bounds
     r_lo = (w_lo * w_lo / A) if w_lo > 0 else 0.25
     r_hi = (A / (h_lo * h_lo)) if h_lo > 0 else 4.0
     r_lo = max(r_lo, 0.2); r_hi = min(max(r_hi, r_lo * 1.01), 5.0)
-    import math as _m
     nsweep = max(1, k - len(cands))
     for t in range(nsweep):
         f = t / max(nsweep - 1, 1)
-        r = _m.exp(_m.log(r_lo) * (1 - f) + _m.log(r_hi) * f)
-        W = _m.sqrt(A * r); H = A / W
+        r = math.exp(math.log(r_lo) * (1 - f) + math.log(r_hi) * f)
+        W = math.sqrt(A * r); H = A / W
         if W >= w_lo - 1e-6 and H >= h_lo - 1e-6:
             cands.append((W, H))
     if not cands:
@@ -125,11 +158,7 @@ def _candidate_outlines(comp, area_star, k):
 
 
 def boundary_repair(bx, by, bw, bh, codes, pre_mask):
-    """Relocate boundary-violating blocks onto their required edge using existing
-    whitespace (we have ~40% slack). For each violating block, find the lowest
-    free slot in the edge column/row that fits, and move it there (overlap-safe;
-    leaves a gap behind, which is fine). Preplaced are never moved. Returns new
-    bx, by (copies)."""
+    """Relocate boundary-violating blocks onto their required edge using whitespace."""
     n = len(bx)
     bx = bx.copy(); by = by.copy()
     eps = 1e-6
@@ -145,8 +174,6 @@ def boundary_repair(bx, by, bw, bh, codes, pre_mask):
         return True
 
     def slots_along(lo, hi, fixed_is_x, fixed_val, size_fixed):
-        """Candidate positions along [lo,hi] (edges of blocks intersecting the
-        fixed band), lowest first (packs boundary blocks low -> tight area)."""
         cands = {lo}
         for j in range(n):
             if fixed_is_x:
@@ -157,44 +184,38 @@ def boundary_repair(bx, by, bw, bh, codes, pre_mask):
                     cands.add(bx[j]); cands.add(bx[j] + bw[j])
         return sorted(c for c in cands if lo - eps <= c <= hi + eps)
 
-    for _ in range(2):  # two passes (bbox may shift as blocks move)
+    for _ in range(6):
         x0 = bx.min(); y0 = by.min(); x1 = (bx + bw).max(); y1 = (by + bh).max()
         for i in range(n):
             c = int(codes[i])
             if c == 0 or pre_mask[i]:
                 continue
-            tx = bx[i]; ty = by[i]
             need_x = None; need_y = None
-            if c & 1:
-                need_x = x0
-            if c & 2:
-                need_x = x1 - bw[i]
-            if c & 8:
-                need_y = y0
-            if c & 4:
-                need_y = y1 - bh[i]
+            if c & 1:  need_x = x0
+            if c & 2:  need_x = x1 - bw[i]
+            if c & 8:  need_y = y0
+            if c & 4:  need_y = y1 - bh[i]
             ok = ((need_x is None or abs(bx[i] - need_x) < eps) and
                   (need_y is None or abs(by[i] - need_y) < eps))
             if ok:
                 continue
-            placed = False
-            if need_x is not None and need_y is not None:      # corner
+            if need_x is not None and need_y is not None:
+                # corner block: only the exact corner satisfies both constraints
                 if free_at(i, need_x, need_y):
-                    bx[i] = need_x; by[i] = need_y; placed = True
-            elif need_x is not None:                            # left/right column
+                    bx[i] = need_x; by[i] = need_y
+            elif need_x is not None:
                 for y in slots_along(y0, y1 - bh[i], True, need_x, bw[i]):
                     if free_at(i, need_x, y):
-                        bx[i] = need_x; by[i] = y; placed = True; break
-            elif need_y is not None:                            # bottom/top row
+                        bx[i] = need_x; by[i] = y; break
+            elif need_y is not None:
                 for x in slots_along(x0, x1 - bw[i], False, need_y, bh[i]):
                     if free_at(i, x, need_y):
-                        bx[i] = x; by[i] = need_y; placed = True; break
+                        bx[i] = x; by[i] = need_y; break
     return bx, by
 
 
 def _constructive_floor(comp):
-    """Deterministic feasible layout: preplaced at targets; movable units
-    shelf-packed in the half-plane to the right of every obstacle."""
+    """Deterministic feasible layout: preplaced at targets; movable shelf-packed."""
     U = comp.U
     ux = np.zeros(U); uy = np.zeros(U)
     x_clear = 0.0
@@ -224,7 +245,6 @@ def finalize(comp, P, N, sweeps=12):
     ux, uy, res = pack(comp, Pa, posn)
     adj = build_adj(comp, Pa, posn)
     ux, uy = redistribute(comp, ux, uy, adj, sweeps=sweeps)
-    # snap preplaced exact
     ux[comp.pre] = comp.px[comp.pre]
     uy[comp.pre] = comp.py[comp.pre]
     return ux, uy, res
@@ -232,15 +252,17 @@ def finalize(comp, P, N, sweeps=12):
 
 class SPFloorplanner:
     def __init__(self, time_budget=2.0, verbose=False, seed=0, use_macros=False,
-                 n_starts=8):
+                 n_starts=8, enable_rotation=True):
         self.time_budget = time_budget
         self.verbose = verbose
         self.seed = seed
         self.use_macros = use_macros
         self.n_starts = n_starts
+        self.enable_rotation = enable_rotation
 
     def solve_with_dims(self, n, b2b, p2b, pins_pos, constraints,
                         dims_wh, pre_xy, hpwl_base, area_base):
+        """Run SP+SA given explicit block dimensions."""
         comp = compile_with_targets(n, b2b, p2b, pins_pos, constraints,
                                     dims_wh, pre_xy, hpwl_base, area_base,
                                     use_macros=self.use_macros)
@@ -248,10 +270,6 @@ class SPFloorplanner:
             return [(0.0, 0.0, float(comp.bw[i]), float(comp.bh[i]))
                     for i in range(n)]
 
-        # Parallel multistart: run n_starts anneals, each with an outline-shaped
-        # seed + fixed-outline penalty; each worker finalizes and returns its TRUE
-        # final cost, so we select the best finalized layout. Prewarm the JIT
-        # in-parent so forked workers inherit compiled code (no recompile).
         k = max(1, int(self.n_starts))
         comp._fast = extract_arrays(comp)
         cl = max(float(np.sqrt(max(comp.area_base, 1e-9))), 1e-6)
@@ -264,15 +282,13 @@ class SPFloorplanner:
                   A["p2b_blk"], A["p2b_w"], A["pin_x"], A["pin_y"],
                   A["hpwl_base"], A["area_base"], A["n_soft"], 25.0, cl,
                   A["cmem"], A["cptr"], 1e18, 1e18, 0.0)
-        # fixed-outline targets (box area = area_base, aspects swept), with mixed
-        # seeds: 'simpl' (analytic quadratic -> low wirelength) and 'shelf'
-        # (fixed-width pack -> low area). Selection keeps the best per case.
+
         outlines = _candidate_outlines(comp, comp.area_base, max(1, k // 2))
-        # analytic 'simpl' seed for most workers (low wirelength); a few 'shelf'
-        # seeds (low area) for diversity. Selection keeps the best per case.
         tasks = [(comp, self.time_budget, self.seed + s,
                   outlines[s % len(outlines)],
-                  "shelf" if s % 4 == 3 else "simpl") for s in range(k)]
+                  "shelf" if s % 4 == 3 else "simpl",
+                  self.enable_rotation) for s in range(k)]
+
         if k > 1:
             try:
                 ctx = mp.get_context("fork")
@@ -283,11 +299,10 @@ class SPFloorplanner:
         else:
             results = [_anneal_worker(tasks[0])]
 
+        # Workers return (cost, bx, by, ok, bw, bh) — shapes already applied.
         ok_res = [r for r in results if r[3]]
 
-        # Outline-filling skyline candidates (cheap, deterministic): analytic seed
-        # packed densely into each candidate width, boundary by construction.
-        # Strong on area+boundary where SP-SA is weak; selection keeps the best.
+        # Skyline candidates use original comp dims (no shape modification).
         cxs, cys = _simpl_place(comp)
         for (W, Hh) in outlines:
             r = skyline_legalize(comp, cxs, cys, W, Htarget=Hh, tol=0.05)
@@ -299,38 +314,82 @@ class SPFloorplanner:
                 continue
             vg = _grouping_from_pos(comp, sbx, sby, sbw, sbh)
             ssc = score_layout(sbx, sby, sbw, sbh, comp.nets, comp.codes,
-                               comp.n_soft, comp.hpwl_base, comp.area_base, v_group=vg)
-            ok_res.append((ssc.cost, sux, suy, True))
+                               comp.n_soft, comp.hpwl_base, comp.area_base,
+                               v_group=vg)
+            ok_res.append((ssc.cost, sbx.copy(), sby.copy(), True,
+                           sbw.copy(), sbh.copy()))
 
         if ok_res:
-            _, ux, uy, _ = min(ok_res, key=lambda r: r[0])
+            _, bx, by, _, bw, bh = min(ok_res, key=lambda r: r[0])
         else:
             ux, uy = _constructive_floor(comp)
+            bx, by, bw, bh = expand(comp, ux, uy)
 
-        bx, by, bw, bh = expand(comp, ux, uy)
-        # safety audit: if any real overlap slipped through, fall back to floor
         if count_overlaps(bx, by, bw, bh) > 0:
             ux, uy = _constructive_floor(comp)
             bx, by, bw, bh = expand(comp, ux, uy)
 
-        # boundary repair: relocate boundary-violating blocks onto their edge
-        # using whitespace; keep only if it improves the true cost.
-        # don't relocate preplaced (hard) or clustered (would break grouping)
+        # boundary repair — only lock truly preplaced blocks (not cluster members)
         pre_mask = np.zeros(n, dtype=bool)
         for u in np.where(comp.pre)[0]:
             for (b, _, _) in comp.members[u]:
                 pre_mask[b] = True
-        if comp.clu is not None:
-            pre_mask |= (comp.clu > 0)
+
         def _cost(_bx, _by):
             vg = _grouping_from_pos(comp, _bx, _by, bw, bh)
             return score_layout(_bx, _by, bw, bh, comp.nets, comp.codes,
                                 comp.n_soft, comp.hpwl_base, comp.area_base,
                                 v_group=vg).cost
+
         rbx, rby = boundary_repair(bx, by, bw, bh, comp.codes, pre_mask)
         if count_overlaps(rbx, rby, bw, bh) == 0 and _cost(rbx, rby) < _cost(bx, by):
             bx, by = rbx, rby
 
-        positions = [(float(bx[i]), float(by[i]), float(bw[i]), float(bh[i]))
-                     for i in range(n)]
-        return positions
+        return [(float(bx[i]), float(by[i]), float(bw[i]), float(bh[i]))
+                for i in range(n)]
+
+    def solve(self, n, area_targets, b2b, p2b, pins_pos, constraints,
+              target_positions=None):
+        """Contest API: no GT dims — derives shapes from area_targets.
+
+        Free blocks → w = h = sqrt(area).  Fixed-shape / preplaced blocks use
+        target_positions.  Estimates hpwl_base / area_base from a quick analytic
+        placement so the SA cost function is properly normalized.
+        """
+        dims_wh, pre_xy = dims_from_areas(
+            n, area_targets, constraints, target_positions, aspect=1.0)
+
+        comp_q = compile_with_targets(n, b2b, p2b, pins_pos, constraints,
+                                      dims_wh, pre_xy, 1.0, 1.0,
+                                      use_macros=False)
+        cx, cy = _simpl_place(comp_q)
+        ne = comp_q.nets
+        bwq = comp_q.bw; bhq = comp_q.bh; buq = comp_q.block_unit
+        hp = 0.0
+        for k in range(ne.b2b_i.size):
+            i = int(ne.b2b_i[k]); j = int(ne.b2b_j[k]); w = float(ne.b2b_w[k])
+            hp += w * (abs(float(cx[buq[i]]) + float(bwq[i]) * 0.5 -
+                           float(cx[buq[j]]) - float(bwq[j]) * 0.5) +
+                       abs(float(cy[buq[i]]) + float(bhq[i]) * 0.5 -
+                           float(cy[buq[j]]) - float(bhq[j]) * 0.5))
+        pins_arr = ne.pins
+        for k in range(ne.p2b_blk.size):
+            b_idx = int(ne.p2b_blk[k]); p = int(ne.p2b_pin[k]); w = float(ne.p2b_w[k])
+            hp += w * (abs(float(pins_arr[p, 0]) -
+                           float(cx[buq[b_idx]]) - float(bwq[b_idx]) * 0.5) +
+                       abs(float(pins_arr[p, 1]) -
+                           float(cy[buq[b_idx]]) - float(bhq[b_idx]) * 0.5))
+        # Connectivity-based hpwl estimate: empirically GT_hpwl ≈ 3.0 × total_w ×
+        # sqrt(area_per_block).  The analytic placement underestimates for
+        # highly-connected cases (blocks co-locate in the unconstrained solution);
+        # this formula keeps the SA energy calibrated relative to GT.
+        total_w = ((float(np.sum(ne.b2b_w)) if ne.b2b_i.size > 0 else 0.0) +
+                   (float(np.sum(ne.p2b_w)) if ne.p2b_blk.size > 0 else 0.0))
+        avg_sqrt_area = float(np.mean(np.sqrt(dims_wh[:n, 0] * dims_wh[:n, 1])))
+        hpwl_conn = total_w * 3.0 * avg_sqrt_area
+        hpwl_est = max(hp, hpwl_conn, 1.0)
+        # Fill fraction is ~97% so block_area_sum ≈ 0.97 × GT_area — close enough.
+        area_est = float(np.sum(dims_wh[:n, 0] * dims_wh[:n, 1]))
+
+        return self.solve_with_dims(n, b2b, p2b, pins_pos, constraints,
+                                    dims_wh, pre_xy, hpwl_est, area_est)
