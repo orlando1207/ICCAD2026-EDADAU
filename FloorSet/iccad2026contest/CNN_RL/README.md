@@ -17,7 +17,11 @@ Evaluated with the corrected scoring formula (`Total Score = Σ Cost[i]·e^{n_i/
 | `analytic_legalizer/my_optimizer.py` (baseline) | 2.0632 | 1.9788 | 100/100 |
 | `rl_skyline_optimizer.py` (Phase 11, `phase11_pin_soft.pt`, square soft blocks) | 2.0172 | 1.8977 | 100/100 |
 | `rl_skyline_optimizer.py` (Phase 13, `phase13_aspect.pt`, predicted aspect ratios) | 1.9705 | 1.8650 | 100/100 |
-| **`rl_skyline_optimizer.py`** (default, Phase 15/B1 contour-aware shaping, `shape_fit=True`) | **1.9593** | **1.8517** | 100/100 |
+| `rl_skyline_optimizer.py` (Phase 15/B1 contour-aware shaping, `shape_fit=True`, β=0) | 1.9593 | 1.8517 | 100/100 |
+| `rl_skyline_optimizer.py` (Phase 15/B1+ height-aware shaping, `SHAPE_HEIGHT_BETA=0.3`) | 1.9343 | 1.8088 | 100/100 |
+| `rl_skyline_optimizer.py` (+ B-cluster reshape via real-cost gate) | 1.9186 | 1.8032 | 100/100 |
+| `rl_skyline_optimizer.py` (+ obstacle-aware x-candidates `OBS_XCAND`) | 1.8828 | 1.7608 | 100/100 |
+| **`rl_skyline_optimizer.py`** (default, + deformable cohesion clusters `FREE_CLUSTER`) | **1.6847** | **1.6039** | 100/100 |
 | `rl_skyline_optimizer.py` (`phase14_aspect_100k.pt`, 100k-sample continuation) | 2.0281 | 1.9159 | 100/100 |
 | `rl_skyline_optimizer_compact.py` (+ whitespace compaction, on Phase 11 ckpt) | 2.0351 | 1.9242 | 100/100 |
 
@@ -29,9 +33,26 @@ forced square, area-preserving (`aspect_pass=True`). **Phase 15/B1**
 (`shape_fit=True`, now default) adds *contour-aware in-packer shaping*
 (`skyline_shape.py`): when the skyline packer lands a soft block it picks the
 area-constant aspect that best fills the current contour notch, as a third
-candidate mode that is never worse than stock — 1.8650 → 1.8517. See
-`ALGORITHM.md` §"Aspect Ratio" for the PoC that motivated it (a free-blocks-only
-post-pass measured 0.00; shaping must live *inside* the packer).
+candidate mode that is never worse than stock — 1.8650 → 1.8517. **Phase 15/B1+**
+adds a height penalty `β·h` to the landing objective (`SHAPE_HEIGHT_BETA=0.3`):
+the original objective only minimised landing-y, so the greedy preferred tall
+narrow shapes that spike the skyline; penalising the block's own height keeps the
+packed envelope low and drops Total Score 1.8517 → **1.8088** (−2.3%, the biggest
+legalize-side win). See `ALGORITHM.md` §"Aspect Ratio" for the PoC that motivated
+it (a free-blocks-only post-pass measured 0.00; shaping must live *inside* the
+packer) and the full β sweep. **Phase 15/B-cluster** (`real_cost_gate`, now
+default) re-packs cluster super-blocks into a contour-fitting aspect (area +
+connectivity preserved) and selects via a gate scored on the *exact* contest cost
+`(1+0.5(area_gap+hpwl_gap))·e^{2V}` instead of the old `bbox·HPWL` proxy — which
+omits the violation term and had made cluster/MIB/B2 reshaping look like losses.
+This unlocks cluster reshaping: 1.8088 → **1.8032**, runtime unchanged (the gate
+short-circuits when no cluster is reshapeable). **Obstacle-aware x-candidates**
+(`OBS_XCAND`, now default) then fix the largest remaining structural waste: the
+skyline only tracks the top contour, so a rigid cluster super-block wider than the
+gap beside a *preplaced* obstacle was bumped **over** it (pushed outward, growing
+the bbox). Offering flush-left/right-of-obstacle x positions lets it slot *beside*
+the obstacle instead — all 100 cases have preplaced+cluster, so this is a big,
+runtime-free win: 1.8032 → **1.7608**.
 `phase14_aspect_100k.pt` continued training from Phase 13 on 80k fresh samples
 (indices 20k–100k) but **regressed** (1.9705→2.0281 avg cost) despite better
 training-curve metrics — `phase13_aspect.pt` remains the default checkpoint.
@@ -202,7 +223,12 @@ b2b wirelength-pull, feasibility mask, **pin-pull** (p2b HPWL field, Phase 11).
 | Phase 12 — PPO + KL-anchor fine-tune | no improvement | abandoned, see `archive/train_ppo.py` |
 | Phase 13 — + aspect-ratio head for "free" soft blocks | 1.9705 (avg) / Total Score 1.8650 | `phase13_aspect.pt`, 20k samples |
 | Phase 14 — continued training on 80k fresh samples (`--init-ckpt phase13 --start-idx 20000`) | 2.0281 (avg) / Total Score 1.9159 | **net loss** — despite better training metrics; fresh Adam on resume likely cause |
-| Phase 15/B1 — contour-aware in-packer shaping (`skyline_shape.py`, `shape_fit=True`) | **1.9593 (avg) / Total Score 1.8517** | current default; never-worse third pack mode |
+| Phase 15/B1 — contour-aware in-packer shaping (`skyline_shape.py`, `shape_fit=True`, β=0) | 1.9593 (avg) / Total Score 1.8517 | never-worse third pack mode |
+| Phase 15/B1+ — height-aware landing objective (`SHAPE_HEIGHT_BETA=0.3`) | 1.9343 (avg) / Total Score 1.8088 | `score += β·h` stops tall shapes spiking the skyline (−2.3%) |
+| Phase 15/B-cluster — re-pack cluster super-blocks, gated on real cost (`real_cost_gate`) | 1.9186 (avg) / Total Score 1.8032 | real-cost gate (exact `(1+0.5(gaps))·e^{2V}` form) unlocks cluster reshaping the `bbox·HPWL` proxy rejected; short-circuited so runtime unchanged |
+| Phase 15/OBS_XCAND — obstacle-aware x-candidates in the shaped packer | 1.8828 (avg) / Total Score 1.7608 | lets a super-block sit *beside* a preplaced obstacle instead of bumped over it; runtime-free (−2.4%) |
+| Phase 15/gate-baseline fix — `min`-over-candidates baseline in the real-cost gate | Total Score 1.7471 | the contest clamps gaps with `max(0,·)`; baselining against candidate 0 hid any *better* candidate (negative gap → 0). `min` baseline makes area wins visible |
+| Phase 15/FREE_CLUSTER — deformable cohesion clusters | **1.6847 (avg) / Total Score 1.6039** | **current default**; place cluster members as individual reshapeable blocks with a cohesion pull so they form a connected blob that conforms to the contour instead of a rigid bottom-left rectangle (−8% Total) |
 | Phase 15/B2 — critical-path slack shaping (`topo_shape.py`, `b2_pass=True`) | 1.9550 (avg) / Total Score 1.8517 | off by default — improves Avg Cost but **Total Score flat** (wins are on small cases) |
 | `analytic_legalizer` baseline | 2.0632 (avg) / Total Score 1.9788 | CNN_RL now beats this |
 

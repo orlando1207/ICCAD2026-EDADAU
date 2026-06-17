@@ -306,8 +306,36 @@ Soft blocks don't have to be square. `ASPECT_BUCKETS = [0.25, 0.5, 1.0, 2.0,
 4.0]` (log-spaced, `N_ASPECT=5`); `w=sqrt(area*aspect), h=sqrt(area/aspect)`
 keeps area exact for any chosen aspect. Oracle check: using GT shapes instead
 of forced squares lowers cost from ~1.16-1.43 down to 1.00 (area/HPWL gap
-mostly closes) — the shape lever is worth learning, **but it is not yet
-trained end-to-end** (BC/PPO labels for aspect are TODO).
+mostly closes) — the shape lever is worth learning.
+
+**UPDATE (Phase 13): the aspect head IS trained end-to-end now.**
+`policy_net.aspect_head` (`Linear→5`) is BC-trained in `train_fast.py` against
+`ar_utils.gt_aspect_bucket(gw, gh)` labels with `aspect_weight=0.5`
+(`aspect_acc ~0.47` vs 0.20 chance); shipped in `phase13_aspect.pt`.
+`rl_skyline_optimizer._rl_centers` calls `policy.act_aspect()` per free block and
+`solve()` overrides `blocks[i].w/h` with the predicted bucket *before*
+`skyline_legalize` (2.0172→1.9705).
+
+**BUT the prediction is mostly clobbered downstream** — `_row_assign_reshape`
+(inside `skyline_legalize`) and now B1's contour shaping (`shape_fit=True`,
+default) re-decide the shape per block, so the learned aspect rarely survives to
+the final geometry. The doc's original "not yet trained / TODO" is obsolete; the
+real open problem is the **prediction↔legalize conflict** (see §"Aspect Ratio"
+below) and that B1's legalize-reshape currently *beats* prediction-led shaping
+(1.8517 < 1.8650), so the learned head's value is capped by its quality (20k
+samples, free-blocks-only, clobbered).
+
+**Phase 16 (pin-bbox canvas) — tried, refuted.** Hypothesis: the model places
+into a canvas sized `sqrt(area·1.6)` ≈ **1.80× GT bbox**, while the pin bbox is
+only **1.23×**; sizing the canvas to the pin extent should force tighter centers
+→ smaller output bbox → lower Area_gap. Retrained `phase16_pinbox.pt` on the
+tight canvas. **Result: no change** — Area_gap 0.477→0.484, output bbox
+1.47×→1.48×, Total Score 1.8517→**1.8688** (worse). Reason: `skyline_legalize`
+chooses its own strip width and re-packs the *relative* arrangement
+(scale-invariant) independently of the canvas, so canvas scale washes out of the
+final geometry. **Area_gap is downstream of how skyline packs, not of where the
+model predicts** — confirming (again) that the lever is block *reshaping*, not
+the prediction frame. Reverted `estimate_canvas`; default stays phase13.
 
 ### Step 8 — Hard constraints (`hard_constraints.py`)
 - `make_target_positions_from_gt(constraints, gt_boxes, block_count)`: builds
@@ -621,6 +649,167 @@ more of the ceiling is what **B2** (joint shape+position over *all* blocks) is
 for — B1 confirms the lever is real and feasibly capturable; B2 is the next step
 if the remaining headroom is worth the LP/GP machinery.
 
+### B1+ RESULT (`SHAPE_HEIGHT_BETA`) — height-aware landing objective, the real win
+
+The original B1 landing objective `landing_y + lam·|center − cx|` was copied
+verbatim from the stock packer, where it is correct: with a *fixed* shape,
+minimising the landing-y (the block's bottom) also minimises its top. But B1
+chooses among shapes of **different heights**, and the objective never penalised a
+shape for being tall — so the greedy systematically preferred tall narrow shapes
+that drop into contour notches but **spike the skyline**, exactly opposite to the
+Area_gap goal of keeping the packed envelope low at fixed width. The shaped pass
+therefore lost the proxy gate to square/row on most cases (modest realised gain).
+
+The fix internalises the block's own height contribution:
+
+```python
+score = landing_y + β·h + lam·|center − cx|      # β = SHAPE_HEIGHT_BETA
+```
+
+A 100-case sweep (β reproduces original B1 at 0; the curve is **non-monotonic**
+because the proxy gate accepts/rejects the shaped layout discretely per case):
+
+| β | Total Score | case0 | case99 |
+|---|---|---|---|
+| 0.0 (original B1) | 1.8517 | 1.8566 | 1.7179 |
+| 0.2 | 1.8278 | 1.8612 | 1.7706 |
+| **0.3 (default)** | **1.8088** | 1.8605 | 1.7160 |
+| 0.4 | 1.8595 | 1.8605 | 1.7590 |
+| 0.5 | 1.8302 | 1.8605 | 1.7590 |
+| 0.7 | 1.8442 | 1.8605 | 1.7100 |
+| 1.0 | 1.8677 | 1.7943 | 1.7607 |
+
+**Total Score 1.8517 → 1.8088 (−0.0429, ~2.3%)** with `β=0.3` — a larger gain
+than B1 itself delivered over stock, and the single biggest legalize-side win in
+the project. The improvement concentrates on large cases (which dominate the
+`e^{n/12}`-weighted Total Score), so case0/case99 barely move while the aggregate
+drops sharply. `β` is now the default in `skyline_shape.py`; re-sweep via the
+`SHAPE_HEIGHT_BETA` env var.
+
+**Overfitting check (split-half).** Because `β` was tuned on the same 100 cases
+that define the score, we re-derived the optimum on disjoint halves: select `β` on
+even-indexed cases, score it on odd (and vice versa), plus a hash-based split.
+`β=0.3` is the **independent minimum on every holdout** (even→odd 1.8044,
+odd→even 1.8134, hash-A→B 1.7959, hash-B→A 1.8223), each equal to that holdout's
+own best — so 0.3 is not a full-set fluke. The non-monotonic 0.4 bump reproduces
+on *both* halves, confirming it is a real proxy-gate artifact, not noise. Caveat:
+all 100 cases share the FloorSet validation distribution; the entire `β∈[0.2,0.3]`
+band beats baseline on every subset, so the choice is safe even if the hidden
+test set shifts the exact optimum slightly.
+
+### Real-cost gate (`real_cost_gate`, default ON) — fixes the proxy mismatch
+
+Three reshape levers — **B-MIB, B2, and B-cluster** — all regressed Total Score
+the *same* way, despite each being feasible and reducing the bbox. The common
+cause is the acceptance gate: the shaped pass kept a candidate only when it beat
+the **`bbox·HPWL` proxy**, which (a) has **no violation term** and (b) *multiplies*
+area·HPWL instead of the normalised *addition* the contest uses. So a candidate
+that shrinks `bbox·HPWL` but worsens violations or the real area/HPWL trade-off
+wins the proxy yet loses the actual cost `(1+0.5(area_gap+hpwl_gap))·e^{2V}`.
+
+The fix scores candidates with the **exact contest-cost form**, computed *after*
+the full `_finish` (slide+enforce+detailed), relative to a shared reference
+candidate (`RLSkylineOptimizer._gate_real_cost`): the reference's bbox/HPWL are
+used as the `area_baseline`/`hpwl_baseline`, so the 0.5-weighted area/HPWL
+trade-off and the `e^{2V}` multiplier are applied in exactly the contest's form.
+This reuses the evaluator's own `evaluate_solution` (no metrics tensor needed),
+so the gate's violation counting matches the scorer's exactly.
+
+| Gate | Reshape variant | Total Score | Runtime |
+|---|---|---|---|
+| `bbox·HPWL` proxy | + B-cluster | 1.8151 (loss) | 0.93s |
+| **real-cost** | **+ B-cluster (default)** | **1.8032 (win)** | **0.92s** |
+| real-cost | + B-cluster + B-MIB | 1.8033 (MIB adds nothing) | — |
+
+**Total Score 1.8088 → 1.8032** with B-cluster gated on real cost. The gate runs
+the legalize+evaluate per candidate (≈2× work) but is **short-circuited to the
+single default path whenever the problem has no reshapeable cluster**, so runtime
+is unchanged (0.92s). MIB is null even under the correct gate (1.8033, tied),
+confirming the earlier B-MIB result was real and not just a proxy artifact. The
+gate is the reusable mechanism: future reshape levers (incl. B2) can be added to
+its variant list and can only help, since selection is now on the true metric.
+
+### Obstacle-aware x-candidates (`OBS_XCAND`, default ON) — the biggest area win
+
+The skyline packer represents the placed area as a **1-D top contour** (`Skyline`):
+`candidate_xs` only proposes left-x positions at skyline-segment boundaries, and
+`_land_y` handles a preplaced obstacle solely by *bumping the block up over it*.
+Consequence: a rigid cluster super-block that is wider than the free gap beside a
+**preplaced obstacle** can never be offered an x that slots into that gap — the
+skyline doesn't know the gap exists — so it is bumped **on top of** the obstacle,
+pushed outward, growing the bbox. All 100 validation cases have both preplaced
+blocks (1–3) and clusters (3–4), so this waste is universal.
+
+The fix (`_pack_one_width_shaped`, `OBS_XCAND`): for every interior unit, augment
+the candidate-x list with the **flush-left (`ox − w`) and flush-right (`ox + ow`)
+positions of each preplaced obstacle**. The unit can then land *beside* the
+obstacle (no x-overlap → low landing-y) instead of over it. `_land_y` still does
+the exact collision/bump check, so nothing infeasible is introduced; the extra
+candidates can only expose a lower-scoring placement.
+
+| | Total Score | Avg Cost | Feasible | Runtime |
+|---|---|---|---|---|
+| B-cluster + real-cost gate | 1.8032 | 1.9186 | 100/100 | 0.92s |
+| **+ OBS_XCAND (default)** | **1.7608** | **1.8828** | 100/100 | 0.93s |
+
+**Total Score 1.8032 → 1.7608 (−0.0424, ~2.4%)** — the largest area win after the
+height-aware β, and **runtime-free** (just more candidate x's per landing). Unlike
+β it is not a tuned scalar but a structural fix (more placement options, gated by
+the real-cost / proxy selection), so overfitting risk is low. case0 1.8605→1.7960,
+case99 1.7160→1.6373. Combines with B-cluster: a reshaped (narrower) super-block
+plus a beside-obstacle x is what actually fills the gap.
+
+### Gate baseline fix + deformable cohesion clusters — the largest win
+
+**The rigid super-block is the dominant remaining waste.** A cluster's only hard
+constraint is *connectivity* (grouping: members form one edge-connected component);
+the rigid rectangle from `prepack_clusters` is an implementation choice, not a
+requirement. Diagnostic on case 99: dropping the rigid super-block and placing the
+members as individual reshapeable blocks cut **bbox −16% and HPWL −13%** — but they
+scattered into 5 components (grouping 1→5), and the `e^{2V}` penalty made it lose.
+So the lever is *deformable but connected* clusters.
+
+**Two pieces were needed.**
+
+1. **Gate baseline fix (Total 1.7608 → 1.7471).** `compute_cost` clamps each gap
+   with `max(0,·)` (you can't beat the GT optimum). The real-cost gate baselined
+   against candidate 0, so any candidate *better* on area got a negative gap →
+   clamped to 0 → its improvement was invisible, and only the violation term
+   decided (the rigid, lowest-violation candidate always won). Fix
+   (`_gate_real_cost`): baseline against the **`min` bbox and `min` HPWL across
+   candidates**, so every gap ≥ 0 and the smallest layout is the zero-gap reference.
+   Inference-valid (no ground truth). This alone improved B-cluster selection.
+
+2. **Cohesion packing (Total 1.7471 → 1.6039, the biggest single win).** The
+   `FREE_CLUSTER` candidate packs cluster members as individual reshapeable blocks
+   (empty super-blocks), but `_pack_one_width_shaped` adds a **cohesion term** to the
+   landing objective: `score += COHESION_W · gap_to_nearest_placed_group_member`
+   (L1 rectangle gap, 0 when abutting). Same-group members are placed consecutively
+   (anchored at the group's lowest `cy`), so each lands abutting the blob already
+   down → the cluster grows as a *connected, contour-conforming* shape instead of a
+   bottom-left rectangle. Only the cohesion pass runs for this candidate (passes 1/2
+   place members disconnected and their area·HPWL proxy ignores grouping). The
+   member's `cluster_group` attribute stays set during packing (cohesion reads it)
+   and is zeroed only for `slide_boundary`/`_finish`.
+
+`COHESION_W` sweep (100 cases): 2→1.6339, 4→1.6158, **8→1.6039**, 16→1.6065,
+32→1.6089 — a smooth U with a broad basin. Default 8.0. **Split-half validated**
+(like β): `W=8` is the **independent minimum on every holdout** (even→odd 1.5923,
+odd→even 1.6164, hash-A→B 1.5917, hash-B→A 1.6167), each equal to that holdout's
+own best, and the U is monotonic on *both* halves (no spurious bumps) — so 8.0 is
+not a full-set fluke. Cleaner than the β curve, which had a reproducible 0.4 bump.
+
+| | Total Score | Avg Cost | case99 | Feasible | Runtime |
+|---|---|---|---|---|---|
+| OBS_XCAND (prev default) | 1.7608 | 1.8828 | 1.6373 | 100/100 | 0.93s |
+| + gate baseline fix | 1.7471 | — | 1.6373 | 100/100 | — |
+| **+ deformable cohesion clusters (default)** | **1.6039** | **1.6847** | **1.4555** | 100/100 | 0.83s |
+
+**Total Score 1.7608 → 1.6039 (−0.157, ~9%)** — by far the largest legalize win,
+and runtime-free (the gate short-circuits; cohesion replaces the rigid pack, not
+adds to it). The real-cost gate is essential: it keeps the deformable layout only
+when the area/HPWL win beats whatever grouping violation remains.
+
 ### B2 RESULT (`topo_shape.py`, `b2_pass`) — works, but flat on Total Score
 
 B2 = Yan-Chu critical-path slack shaping on `analytic_legalizer`'s constraint
@@ -656,6 +845,16 @@ cases** — i.e. a true joint **GP/LP solve over all blocks including clusters**
 (reshape super-blocks, not just singletons), with a tight-packing guarantee the
 constraint-graph packer doesn't provide. That is the remaining, heavier B2 (scipy
 is available; cvxpy is not). B1 remains the default best.
+
+**B2 under the real-cost gate (`RCG_B2=1`, default OFF).** Once the proxy gate was
+replaced by the real-cost gate, B2 was added as an extra candidate (apply
+`legalize_b2` to each base layout, `_finish`, then let `_gate_real_cost` pick).
+Result: Avg Cost 1.9186 → **1.9144** (B2 again wins small cases) but Total Score
+only 1.8032 → **1.8028** (−0.0004) — the same small-case-concentration story,
+now confirmed under the *correct* gate, so the flat Total is structural, not a
+gate artifact. It also costs +0.13s/case (B2 has no cheap short-circuit, unlike
+cluster, so it runs every case). **Kept off by default**: the marginal Total gain
+doesn't justify the runtime, especially given leaderboard runtime uncertainty.
 
 ---
 

@@ -3,7 +3,41 @@
 Focused implementation plan for the legalizer-side wins, all centred on the
 **bounding box**: shrinking it (Area_gap) and making forced blocks reach its
 edges (boundary violations). Derived from this session's measurements on the
-current default (B1, Total Score **1.8517**).
+then-default (B1, Total Score 1.8517).
+
+> **UPDATE 1 — B1+ height-aware objective (Total Score 1.8517 → 1.8088).**
+> The biggest single legalize gain came from fixing B1's landing objective: it
+> minimised only `landing_y`, so the greedy chose tall narrow shapes that fill
+> notches but spike the skyline. Adding `score += β·h` (`SHAPE_HEIGHT_BETA=0.3`,
+> swept + split-half validated on 100 cases) keeps the packed envelope low →
+> **−2.3% Total Score.** See `ALGORITHM.md` §"B1+ RESULT".
+>
+> **UPDATE 2 — real-cost gate unlocks B-cluster (Total Score 1.8088 → 1.8032).**
+> B-MIB, B2 and B-cluster all *failed identically* under the `bbox·HPWL` proxy gate
+> (it has no `e^{2V}` violation term and multiplies instead of norm-adding). Replacing
+> the Pass-acceptance with the EXACT contest cost form `(1+0.5(area_gap+hpwl_gap))·
+> e^{2V}`, scored relative to a reference candidate, turns B-cluster from a net loss
+> into a **net win**. Default ON (`real_cost_gate`), short-circuited to the single
+> default path when no reshapeable cluster exists → **runtime unchanged (~0.92s).**
+> See `ALGORITHM.md` §"Real-cost gate". This is the gate fix the items below needed.
+>
+> **UPDATE 3 — obstacle-aware x-candidates (Total Score 1.8032 → 1.7608, biggest area win).**
+> The skyline tracks only the top contour, so a rigid cluster super-block wider than
+> the gap beside a *preplaced* obstacle was bumped **over** it (pushed outward,
+> growing bbox) — the packer was never offered the beside-obstacle x. Adding
+> flush-left/right-of-obstacle x candidates (`OBS_XCAND`, default ON) lets it slot
+> beside instead. All 100 cases have preplaced+cluster → **−2.4% Total Score, runtime
+> free.** See `ALGORITHM.md` §"Obstacle-aware x-candidates".
+>
+> **UPDATE 4 — deformable cohesion clusters (Total Score 1.7608 → 1.6039, the biggest win).**
+> The rigid super-block is the dominant remaining waste (case 99: freeing it cuts
+> bbox −16%), but freeing scatters the cluster (grouping ↑). Solved by (a) fixing the
+> real-cost gate to baseline against `min`-over-candidates (the `max(0,gap)` clamp had
+> hidden any *better* candidate → 1.7471), then (b) packing freed members with a
+> **cohesion pull** (`COHESION_W=8`) so they grow a connected, contour-conforming blob
+> (`FREE_CLUSTER`, default ON) → **−9% Total Score, runtime-free.** This is the
+> connected-deformable-cluster lever Items B/C were circling. See `ALGORITHM.md`
+> §"Gate baseline fix + deformable cohesion clusters".
 
 ## Cost anatomy (Total-Score weighted, 100 cases)
 
@@ -94,17 +128,42 @@ blocks, and reshaping them is **triple-hit**:
      onto forced blocks (the boundary fix compaction couldn't deliver).
   3. **grouping** — re-packing clusters can also keep them connected.
 
-**B-MIB (tractable, do first):** pick one shared (w,h) per MIB group that best
-fits the skyline contour; fold into `skyline_shape.py` (B1 currently skips MIB).
-Small, low-risk.
+**B-MIB (tractable, done first):** ✗ **net loss (1.8517→1.8576), reverted to a
+default-off flag (`mib_shape`).** Implemented in `skyline_shape.py`: the first
+member of a fully-free MIB group searches the aspect ladder and commits its
+aspect; the rest reuse it (identical shapes, area-preserving, 0 MIB violations
+after guarding against groups that contain a clustered/fixed member). Feasible
+(100/100) but regressed: Pass 3 is gated by the `bbox·HPWL` proxy, and MIB-
+reshaped layouts won that proxy on some cases while being worse on the *real*
+contest cost (proxy ≠ exact cost). Confirms MIB (14% of blocks, already 0
+violation, identical-shape constraint) is too constrained to help. Kept behind
+`mib_shape=False`.
 
-**B-cluster (hard, the real prize):** reshape a cluster super-block to a target
-aspect by re-packing its members (`prepack_clusters` with an aspect target),
-then let the packer place the reshaped super-block. Keeps area + connectivity.
-This is where the Total-Score-moving Area_gap lives.
+**B-cluster (done):** ✓ **net win once gated on real cost (1.8088→1.8032), default
+ON.** Implemented in `skyline_shape.py`: an eligible cluster (all members
+`boundary_code==0`, none preplaced — i.e. plain shelf-packed) gets a shape ladder
+by re-running the shelf-pack at several row widths (`CLUSTER_ROW_FACTORS × √area`,
+via local `_shelf_pack_rw`). Each candidate is a differently-shaped super-block
+with identical area + connectivity; the packer picks the aspect minimising
+`landing_y + β·h + lam·pull`, mutating `super_blocks[gid]` so the immediately-
+following `_materialize` is consistent (snapshot+restore keeps the object pristine;
+`slide_boundary`/`enforce_hard` read only positions, verified). Feasible 100/100.
 
-**Expected:** the only remaining lever that moves Total Score on large cases.
-**Status:** ☐ next — start with B-MIB
+**The proxy gate is what made it (and B-MIB, B2) look like losses.** Under the
+Pass-3 `bbox·HPWL` proxy, cluster reshaping regressed (1.8088→1.8151) — the proxy
+has no `e^{2V}` term and multiplies instead of norm-adding, so a reshaped layout
+that shrinks bbox·HPWL but worsens violations/the real trade-off still "wins" the
+gate. The **real-cost gate** (see below + `ALGORITHM.md`) fixes this and flips
+B-cluster to a win. MIB adds nothing even under the correct gate (tied 1.8033),
+consistent with B-MIB's earlier null result.
+
+**Status:** B-cluster ✓ **win, default ON** (via real-cost gate). B-MIB ✗ null even
+under the correct gate. B2 ✓ added to the gate (`RCG_B2=1`, **default OFF**):
+under the real-cost gate B2 is a clean win on Avg Cost (1.9186→1.9144) but only
+**−0.0004 on Total Score** (1.8032→1.8028) — its gains land on small cases, which
+the `e^{n/12}` weighting discounts — while costing +0.13s runtime (B2 has no cheap
+short-circuit, so it runs every case). Kept off: the marginal Total gain doesn't
+justify the runtime, especially given leaderboard runtime uncertainty.
 
 ### C — BOTTOM/LEFT placement fix  → biggest boundary bucket (deferred)
 **Problem:** 171 BOTTOM/LEFT viols — forced blocks not at y=0/x=0 (position, not

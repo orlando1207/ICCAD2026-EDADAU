@@ -48,8 +48,14 @@ def estimate_canvas(area_target: torch.Tensor,
     (b) contains every pin. Pins are fixed terminals the placement must
     reach, so they are a hard lower bound on the canvas extent.
 
-    This is a rough Phase-0 heuristic; a smarter aspect-ratio-aware canvas
-    can replace it later without changing the env interface.
+    NOTE (Phase 16, reverted): tried sizing the canvas to the PIN BOUNDING BOX
+    (1.23× GT) instead of `sqrt(area·1.6)` (1.80× GT), expecting tighter centers
+    → smaller output bbox → lower Area_gap. **It did not work** — Area_gap stayed
+    0.477→0.484, output bbox 1.47×→1.48×, Total Score regressed 1.8517→1.8688.
+    Reason: `skyline_legalize` chooses its own strip width and re-packs the
+    *relative* arrangement (scale-invariant) independently of the canvas, so the
+    canvas scale washes out of the final geometry. Area_gap is set by how skyline
+    packs the arrangement (→ block reshaping), not by the canvas size. Reverted.
     """
     valid_area = area_target[area_target > 0]
     total_area = float(valid_area.sum()) if valid_area.numel() else 1.0
@@ -95,6 +101,12 @@ class PlacementEnv:
         self.grid = grid
         self.area_margin = area_margin
         self.device = device
+        # Inference fast-path flags (default off = training/test behaviour). The
+        # greedy rollout in RLSkylineOptimizer reads only `current_block` from the
+        # state and discards the reward, so the placeholder occupancy grid and the
+        # terminal contest-cost are pure waste during inference.
+        self.skip_occupancy = False
+        self.skip_terminal_cost = False
         self._reset_internal_state()
 
     # ------------------------------------------------------------------ #
@@ -253,7 +265,7 @@ class PlacementEnv:
         done = self.ptr >= len(self.order)
         reward = 0.0  # Phase 0: terminal reward only (shaping is Phase 4 §4)
         info = {"block_idx": block_idx}
-        if done:
+        if done and not self.skip_terminal_cost:     # inference discards the reward
             cost = self._terminal_cost()
             reward = -cost
             info["contest_cost"] = cost
@@ -303,7 +315,8 @@ class PlacementEnv:
         current_block = (self.order[self.ptr] if self.ptr < len(self.order)
                          else None)
         return {
-            "occupancy": self._occupancy_grid(),     # [G, G] placeholder
+            "occupancy": (None if self.skip_occupancy   # unused in inference
+                          else self._occupancy_grid()),  # [G, G] placeholder
             "positions": self.positions.clone(),     # [N, 4], NaN = unplaced
             "current_block": current_block,           # block id to place next
             "ptr": self.ptr,

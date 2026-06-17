@@ -63,7 +63,8 @@ class RLSkylineOptimizer(FloorplanOptimizer):
     def __init__(self, verbose: bool = False, checkpoint=None,
                  center_source: str = "model", compact_pass: bool = False,
                  aspect_pass: bool = True, shape_fit: bool = True,
-                 b2_pass: bool = False, boundary_pass: bool = False):
+                 b2_pass: bool = False, boundary_pass: bool = False,
+                 mib_shape: bool = False, cluster_shape: bool = False):
         super().__init__(verbose)
         self.center_source = center_source
         self.compact_pass = compact_pass        # extra whitespace compaction (experiment)
@@ -71,6 +72,19 @@ class RLSkylineOptimizer(FloorplanOptimizer):
         self.shape_fit = shape_fit              # contour-aware in-packer shaping (Phase 15/B1)
         self.b2_pass = b2_pass                  # critical-path slack shaping (Phase 15/B2)
         self.boundary_pass = boundary_pass      # TOP/RIGHT boundary reshape (Item A)
+        self.mib_shape = mib_shape              # reshape free MIB groups (Item B-MIB, net loss)
+        import os                               # re-pack cluster super-blocks (Item B-cluster)
+        self.cluster_shape = cluster_shape or os.environ.get("CLUSTER_SHAPE", "0") == "1"
+        # Real-cost gate (default ON): pick among reshape variants by the EXACT contest
+        # cost form (1+0.5(area_gap+hpwl_gap))·e^{2V} — relative to a reference candidate
+        # — instead of the bbox·HPWL proxy that omits the violation multiplier. Unlocks
+        # cluster reshaping (1.8088→1.8032); short-circuited to the default single path
+        # when the problem has no reshapeable cluster, so runtime is unchanged (~0.92s).
+        self.real_cost_gate = os.environ.get("REAL_COST_GATE", "1") == "1"
+        # Deformable-cluster candidate: place cluster members as individual reshapeable
+        # blocks (drop the rigid super-block) so they conform to the contour; the
+        # real-cost gate keeps it only if the area win beats any grouping violation.
+        self.free_cluster = os.environ.get("FREE_CLUSTER", "1") == "1"
         self._model = None
         if center_source == "model":
             ckpt_path = Path(checkpoint) if checkpoint else _DEFAULT_CKPT
@@ -107,6 +121,8 @@ class RLSkylineOptimizer(FloorplanOptimizer):
 
         gnn, policy, grid = self._model
         env = PlacementEnv(grid=grid)
+        env.skip_occupancy = True          # rollout uses rasterize_env, not the grid
+        env.skip_terminal_cost = True      # rollout discards the reward
         env.reset(area_targets, b2b, p2b, pins, constraints, torch.ones(8),
                   target_positions=target_positions)
         node_emb, _ = gnn.encode_problem(area_targets, constraints, b2b, block_count)
@@ -159,6 +175,34 @@ class RLSkylineOptimizer(FloorplanOptimizer):
         hp = _raw_hpwl(pos, b2b, p2b, pins)
         return bbox * (hp if hp > 1e-9 else 1.0)
 
+    def _gate_real_cost(self, cands, constraints, b2b, p2b, pins,
+                        area_targets, target_positions):
+        """Pick the candidate layout with the lowest EXACT contest cost
+        `(1+0.5(area_gap+hpwl_gap))·e^{2V}`. The contest clamps each gap with
+        `max(0,·)` (you can't beat the GT optimum), so to keep *improvements visible*
+        we baseline against the BEST candidate on each axis — `min` bbox and `min`
+        HPWL across candidates — making every gap ≥ 0 and the smallest layout the
+        zero-gap reference. (Using candidate 0 as the baseline hid any candidate that
+        was better than it: its negative gap clamped to 0, so only the violation term
+        decided and the lowest-violation candidate always won.) Baselines use only the
+        candidate layouts — no ground-truth — so this is valid at inference."""
+        from iccad2026_evaluate import evaluate_solution, compute_cost
+
+        ms = [evaluate_solution(
+                  {"positions": p, "runtime": 1.0}, {}, constraints, b2b, p2b, pins,
+                  area_targets, target_positions, median_runtime=1.0)
+              for p in cands]
+        a0 = min(m.bbox_area for m in ms)
+        h0 = min(m.hpwl_total for m in ms)
+        best_pos, best_cost = None, float("inf")
+        for pos, m in zip(cands, ms):
+            ag = (m.bbox_area - a0) / max(a0, 1e-9)
+            hg = (m.hpwl_total - h0) / max(h0, 1e-9)
+            cost = compute_cost(hg, ag, m.violations_relative, 1.0, m.is_feasible)
+            if cost < best_cost - 1e-9:
+                best_cost, best_pos = cost, pos
+        return best_pos
+
     def _maybe_b2(self, pos_b1, blocks, super_blocks, cluster_groups,
                   area_targets, b2b, p2b, pins, finish):
         """Run the B2 critical-path shaping from B1's relative order; return
@@ -182,6 +226,7 @@ class RLSkylineOptimizer(FloorplanOptimizer):
         pins_pos: torch.Tensor,
         constraints: torch.Tensor,
         target_positions: torch.Tensor = None,
+        centers_override: Optional[Tuple] = None,
     ) -> List[Tuple[float, float, float, float]]:
 
         blocks, mib_groups, cluster_groups = parse_and_init(
@@ -191,7 +236,11 @@ class RLSkylineOptimizer(FloorplanOptimizer):
 
         cx = cy = None
         aspect_choice: Dict[int, float] = {}
-        if self.center_source == "model":
+        if centers_override is not None:
+            # External center/shape source (e.g. gnn_joint_placer) feeds the SAME
+            # legalize tail that the grid+greedy RL rollout normally feeds.
+            cx, cy, aspect_choice = centers_override
+        elif self.center_source == "model":
             try:
                 centers = self._rl_centers(
                     area_targets, b2b_connectivity, p2b_connectivity, pins_pos,
@@ -217,28 +266,108 @@ class RLSkylineOptimizer(FloorplanOptimizer):
             blocks[i].w = math.sqrt(area * aspect)
             blocks[i].h = math.sqrt(area / aspect)
 
-        if self.shape_fit:                          # Phase 15/B1: contour-aware shaping
-            from skyline_shape import skyline_legalize_shaped
-            pos, _ = skyline_legalize_shaped(
-                blocks, super_blocks, cluster_groups, cx, cy, area_targets,
-                b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
-            )
-        else:
-            pos, _ = skyline_legalize(
-                blocks, super_blocks, cluster_groups, cx, cy, area_targets,
-                b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
-            )
-        if self.compact_pass:                       # squeeze residual whitespace
-            from analytic_legalizer.topology import compact
-            pos = compact(pos, blocks, super_blocks, cluster_groups)
+        def _legalize(cluster_flag: bool, mib_flag: bool, sb=None, cg=None,
+                      cohesion: bool = False):
+            sb = super_blocks if sb is None else sb     # override → e.g. free clusters
+            cg = cluster_groups if cg is None else cg
+            if self.shape_fit:                      # Phase 15/B1: contour-aware shaping
+                from skyline_shape import skyline_legalize_shaped
+                p, _ = skyline_legalize_shaped(
+                    blocks, sb, cg, cx, cy, area_targets,
+                    b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
+                    mib_shape=mib_flag, cluster_shape=cluster_flag, cohesion=cohesion,
+                )
+            else:
+                p, _ = skyline_legalize(
+                    blocks, sb, cg, cx, cy, area_targets,
+                    b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos,
+                )
+            if self.compact_pass:                   # squeeze residual whitespace
+                from analytic_legalizer.topology import compact
+                p = compact(p, blocks, sb, cg)
+            return p
 
-        def _finish(p):
-            p = slide_boundary(p, blocks, super_blocks, cluster_groups)
+        def _finish(p, sb=None, cg=None):
+            sb = super_blocks if sb is None else sb
+            cg = cluster_groups if cg is None else cg
+            p = slide_boundary(p, blocks, sb, cg)
             p = enforce_hard(p, blocks, area_targets)
             return _detailed_place(p, blocks, b2b_connectivity,
                                    p2b_connectivity, pins_pos)
 
-        pos = _finish(pos)
+        # The reshape variants only differ from the default when the problem has a
+        # cluster that is actually reshapeable (plain shelf-packed: every member is
+        # interior and non-preplaced). Skip the (2×-cost) gate otherwise so most
+        # cases pay nothing extra.
+        has_elig_cluster = any(
+            members and all(blocks[m].boundary_code == 0 and not blocks[m].is_preplaced
+                            for m in members)
+            for members in cluster_groups.values())
+
+        import os
+        b2_in_gate = self.b2_pass or os.environ.get("RCG_B2", "0") == "1"
+        free_cluster = self.free_cluster or os.environ.get("FREE_CLUSTER", "0") == "1"
+        has_cluster = bool(cluster_groups)
+
+        if self.real_cost_gate and self.shape_fit and (
+                has_elig_cluster or b2_in_gate or (free_cluster and has_cluster)):
+            # Build finished candidates from the reshape variants and pick the one
+            # with the lowest EXACT-form contest cost, scored relative to a shared
+            # reference (candidate 0 = current default: no cluster/MIB reshape). This
+            # replaces the bbox·HPWL proxy gate, which omits the e^{2V} violation term.
+            if has_elig_cluster:
+                _vsel = os.environ.get("RCG_VARIANTS", "cluster")
+                variants = {
+                    "cluster": [(False, False), (True, False)],
+                    "all": [(False, False), (True, False),
+                            (False, True), (True, True)],
+                    "clustermib": [(False, False), (True, True)],
+                }[_vsel]
+            else:
+                variants = [(False, False)]
+            cands = [_finish(_legalize(cf, mf)) for cf, mf in variants]
+            if free_cluster and has_cluster:
+                # Deformable-cluster candidate: drop the rigid super-block and place
+                # each cluster member as an individual reshapeable block, so it can
+                # conform to the contour / wrap around obstacles instead of being a
+                # bottom-left-packed rectangle. Connectivity is NOT guaranteed, but
+                # the real-cost gate scores any resulting grouping violation via e^{2V},
+                # so this is kept only when the area/HPWL win outweighs it.
+                saved_cg = {i: b.cluster_group for i, b in enumerate(blocks)
+                            if b.cluster_group}
+                try:
+                    # Pack with cluster_group INTACT (cohesion reads it to grow
+                    # connected blobs), then zero it so slide_boundary/_finish treat
+                    # the now-deformed members individually.
+                    fc_pos = _legalize(False, False, sb={}, cg={}, cohesion=True)
+                    for i in saved_cg:
+                        blocks[i].cluster_group = 0
+                    fc = _finish(fc_pos, sb={}, cg={})
+                    if self._overlap_free(fc):
+                        cands.append(fc)
+                except Exception as e:  # pragma: no cover
+                    if self.verbose:
+                        print(f"[RLSkyline] free-cluster candidate failed ({e})")
+                finally:
+                    for i, g in saved_cg.items():
+                        blocks[i].cluster_group = g
+            if b2_in_gate:                          # B2: critical-path slack shaping
+                from topo_shape import legalize_b2
+                for base in list(cands):            # try B2 on each base candidate
+                    try:
+                        b2pos = _finish(legalize_b2(
+                            base, blocks, super_blocks, cluster_groups, area_targets,
+                            b2b=b2b_connectivity, p2b=p2b_connectivity, pins=pins_pos))
+                        if self._overlap_free(b2pos):
+                            cands.append(b2pos)
+                    except Exception as e:  # pragma: no cover
+                        if self.verbose:
+                            print(f"[RLSkyline] B2 candidate failed ({e})")
+            pos = self._gate_real_cost(
+                cands, constraints, b2b_connectivity, p2b_connectivity,
+                pins_pos, area_targets, target_positions)
+        else:
+            pos = _finish(_legalize(self.cluster_shape, self.mib_shape))
 
         if self.boundary_pass:                       # Item A: TOP/RIGHT boundary reshape
             try:
@@ -248,8 +377,8 @@ class RLSkylineOptimizer(FloorplanOptimizer):
                 if self.verbose:
                     print(f"[RLSkyline] boundary reshape failed ({e})")
 
-        if self.b2_pass:                             # Phase 15/B2: critical-path shaping
-            try:
+        if self.b2_pass and not b2_in_gate:          # legacy proxy-gated B2 path
+            try:                                     # (skipped when the real-cost gate handles B2)
                 pos = self._maybe_b2(
                     pos, blocks, super_blocks, cluster_groups, area_targets,
                     b2b_connectivity, p2b_connectivity, pins_pos, _finish)
