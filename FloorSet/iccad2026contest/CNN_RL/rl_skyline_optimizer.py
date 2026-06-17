@@ -66,8 +66,14 @@ class RLSkylineOptimizer(FloorplanOptimizer):
                  b2_pass: bool = False, boundary_pass: bool = False,
                  mib_shape: bool = False, cluster_shape: bool = False):
         super().__init__(verbose)
+        import os
         self.center_source = center_source
         self.compact_pass = compact_pass        # extra whitespace compaction (experiment)
+        # Phase 13 aspect head. Env override (ASPECT_PASS=0) lets the eval harness —
+        # which only passes verbose — disable it for checkpoints trained with
+        # --aspect-weight 0.0 (untrained head would otherwise pick garbage ratios).
+        if "ASPECT_PASS" in os.environ:
+            aspect_pass = os.environ["ASPECT_PASS"] == "1"
         self.aspect_pass = aspect_pass          # predict soft-block aspect ratio (Phase 13)
         self.shape_fit = shape_fit              # contour-aware in-packer shaping (Phase 15/B1)
         self.b2_pass = b2_pass                  # critical-path slack shaping (Phase 15/B2)
@@ -87,6 +93,8 @@ class RLSkylineOptimizer(FloorplanOptimizer):
         self.free_cluster = os.environ.get("FREE_CLUSTER", "1") == "1"
         self._model = None
         if center_source == "model":
+            import os
+            checkpoint = checkpoint or os.environ.get("RL_CKPT")   # eval-time override
             ckpt_path = Path(checkpoint) if checkpoint else _DEFAULT_CKPT
             if ckpt_path.exists():
                 try:

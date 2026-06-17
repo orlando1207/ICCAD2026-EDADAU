@@ -79,30 +79,52 @@ python3 CNN_RL/plot_rl_skyline.py --test-id 0 --ground-truth --out CNN_RL/gt_cas
 python3 CNN_RL/plot_compare.py --test-id 0 --out CNN_RL/compare_case0.png
 ```
 
+### Dataset (required for training)
+
+Training uses the **FloorSet-Lite** dataset (~6 GB download, ~24 GB extracted).
+`train_fast.py` calls `FloorplanDatasetLite` which **auto-downloads** the archive
+from HuggingFace on the first run if it is not already present:
+
+```
+FloorSet/floorset_lite/worker_0/ … worker_99/   ← extracted here automatically
+FloorSet/LiteTensorData_v2.tar.gz               ← cached tar (safe to delete after extraction)
+```
+
+The dataset is gitignored (too large); it is re-downloaded on each fresh clone.
+No manual step is needed — just run the training command and wait for the initial
+download (~10–30 min depending on connection speed).
+
 ### Train from scratch
 
 One script, `train_fast.py` — vectorised rasterizer + batched GNN/CNN forward
-+ parallel `DataLoader` workers (~10+ samples/s on a 24-core box):
++ parallel `DataLoader` workers (~10+ samples/s on a 12-core + GPU box):
 
 ```bash
+# Run from FloorSet/iccad2026contest/
 python3 CNN_RL/train_fast.py \
     --num-samples 20000 --epochs 1 --grid 64 --workers 16 \
     --soft-sigma 1.5 --aspect-weight 0.5 --ckpt-name phase13_aspect.pt
 ```
 
+**Expected wall-clock time**: ~30–45 min for 20k samples on a 12-16 core machine
+with a GPU. CPU-only is ~3–5× slower (rasterizer is the bottleneck, not the
+forward pass — use as many `--workers` as physical cores allow).
+
+Key flags:
 - `--soft-sigma 1.5`: Gaussian-blurred target-cell label (soft cross-entropy)
-  instead of one-hot — improved avg cost 2.0944 -> 2.0570.
-- The 5th raster channel (`CH_PIN_PULL`, pin-aware HPWL field, always on in
-  `canvas_raster.py`) improved avg cost 2.0570 -> 2.0408.
+  instead of one-hot — improved avg cost 2.0944 → 2.0570.
 - `--aspect-weight 0.5`: weight of the aspect-bucket BC loss (Phase 13) —
-  predicts a non-square shape for "free" soft blocks, avg cost 2.0172 -> 1.9705.
+  predicts a non-square shape for "free" soft blocks, avg cost 2.0172 → 1.9705.
+- `--wl-weight 0.0` *(default)*: wirelength-auxiliary loss weight. Set to 0.05
+  to add a soft-argmax pull toward connected blocks' GT positions (experimental;
+  helps relative to its own control but does not beat a fresh phase13 in A/B).
 - Checkpoint is written to `checkpoints/<ckpt-name>`; `rl_skyline_optimizer.py`
   loads `checkpoints/phase13_aspect.pt` by default (`_DEFAULT_CKPT`).
 
 ### Continue training (more data, same checkpoint)
 
-The full dataset has 1,008,000 samples, so a 20k run only ever sees indices
-`[0, 20000)`. To keep training the same model on fresh data:
+The full dataset has 1,008,000 samples; a 20k run only ever sees indices
+`[0, 20000)`. To keep training on fresh data:
 
 ```bash
 python3 CNN_RL/train_fast.py \
@@ -110,15 +132,22 @@ python3 CNN_RL/train_fast.py \
     --epochs 1 --grid 64 --workers 16 \
     --soft-sigma 1.5 --aspect-weight 0.5 \
     --init-ckpt CNN_RL/checkpoints/phase13_aspect.pt \
-    --ckpt-name phase13_aspect.pt
+    --ckpt-name phase14_aspect.pt
 ```
 
-- `--init-ckpt <path>`: load gnn/policy weights from an existing checkpoint
-  before training (optimizer state is fresh Adam, not resumed).
-- `--start-idx N`: skip the first `N` dataset samples, so the next run trains
-  on data the model hasn't seen yet instead of repeating the same slice.
-- `--ckpt-name` overwrites in place if it matches `--init-ckpt`, or use a new
-  name (e.g. `phase14_aspect.pt`) to A/B against the previous checkpoint.
+- `--init-ckpt <path>`: load gnn/policy weights **and optimizer state** from an
+  existing checkpoint. If the checkpoint includes a saved optimizer state (all
+  checkpoints produced after Phase 15), it is restored and the stored LR is
+  overridden with `--lr` — so momentum/variance are warm and the early steps are
+  stable. Older checkpoints (pre-Phase 15, no `"opt"` key) fall back to a fresh
+  Adam automatically.
+- `--start-idx N`: skip the first `N` dataset samples so each continuation run
+  trains on unseen data.
+- `--ckpt-name`: use a different name (e.g. `phase14_aspect.pt`) to A/B against
+  the previous checkpoint; overwrite in place only if you are sure.
+- **LR for continuation**: use a lower LR than the initial run (e.g. `--lr 1e-4`
+  instead of the default `1e-3`) to avoid a destabilising transient from any
+  remaining optimizer-state mismatch.
 
 ### Run the acceptance tests
 
@@ -253,14 +282,14 @@ b2b wirelength-pull, feasibility mask, **pin-pull** (p2b HPWL field, Phase 11).
    `ar_utils.ASPECT_BUCKETS` per "free" block (BC-trained on GT aspect ratios,
    `aspect_acc` ~0.46-0.48 vs 0.20 chance) and overrides that block's (w,h)
    area-preservingly before legalization — 2.0172 -> 1.9705.
-6. **Continuing BC training on fresh data can hurt** (Phase 14). Resuming from
-   a checkpoint with `--init-ckpt` resets the Adam optimizer state (momentum
-   and variance are cold), which can cause a destabilizing transient in the
-   early steps of the continuation run. Despite better training-curve metrics
-   (`cell_acc` 0.09→0.15, `aspect_acc` 0.47→0.52), eval cost regressed
-   1.9705→2.0281. Possible mitigations: lower `--lr` for continuation runs
-   (e.g. `1e-4` vs default `1e-3`), or save/restore optimizer state alongside
-   model weights.
+6. **Continuing BC training on fresh data can hurt** (Phase 14). Early runs
+   with `--init-ckpt` reset Adam state (momentum/variance cold), causing a
+   destabilizing transient: `cell_acc` 0.09→0.15 and `aspect_acc` 0.47→0.52
+   looked better on the training curve but eval cost regressed 1.9705→2.0281.
+   **Phase 15+ fix**: checkpoints now include the optimizer state (`"opt"` key);
+   `--init-ckpt` restores it automatically (with LR overridden to `--lr`), so
+   warm momentum is preserved. For checkpoints that predate this (no `"opt"`
+   key), use a lower `--lr` (e.g. `1e-4`) to dampen the cold-start transient.
 
 For full phase-by-phase detail, failure modes, and file-level notes, see
 [`ALGORITHM.md`](ALGORITHM.md). For deprecated/abandoned code, see

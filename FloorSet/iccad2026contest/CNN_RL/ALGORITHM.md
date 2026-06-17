@@ -856,6 +856,78 @@ gate artifact. It also costs +0.13s/case (B2 has no cheap short-circuit, unlike
 cluster, so it runs every case). **Kept off by default**: the marginal Total gain
 doesn't justify the runtime, especially given leaderboard runtime uncertainty.
 
+### Phase 16 — from-scratch BC retrain (wl-aux + aspect-cut) — both refuted
+
+Revisited the **network side** (every prior Phase-15 win was legalize-side). Two
+BC-objective changes were hypothesised to attack `HPWL_gap` / free model capacity:
+
+1. **Wirelength-aux loss** (`--wl-weight`, code already in `train_fast.py:236-246`):
+   soft-argmax the predicted cell distribution to an expected `(col,row)`, pull it
+   toward each b2b neighbour's GT cell (weighted Manhattan, in cell units). A
+   differentiable "place connected blocks near each other" term the per-cell CE
+   lacks. Rationale: `HPWL_gap` (~0.44) is the largest remaining gap and `pos_loss`
+   has no net concept.
+2. **Cut the aspect head** (`--aspect-weight 0.0` + `ASPECT_PASS=0`): hypothesis was
+   that B1+/cohesion reshape every soft block downstream, so the learned aspect is
+   clobbered (see §"Aspect Ratio") and its 0.5-weighted training capacity is wasted.
+
+All runs are **from scratch, 20k samples**, same config as phase13 otherwise; eval
+through the *current default* legalizer (FREE_CLUSTER/OBS_XCAND/real-cost gate all on).
+A new `ASPECT_PASS` env var (`rl_skyline_optimizer.py`) lets the eval harness — which
+only passes `verbose` — disable the aspect head for checkpoints trained without it
+(an untrained head otherwise picks garbage ratios). `train_fast.py` also gained
+`--milestone-every` (numbered non-overwriting snapshots, e.g. `_50k.pt`) and a
+`_best.pt` save (lowest windowed total train-loss).
+
+| Checkpoint | aspect | wl-aux | Total Score | Avg Cost | Feasible |
+|---|---|---|---|---|---|
+| **phase13_aspect (default)** | ✅ 0.5 | ✗ | **1.6039** | 1.6847 | 100/100 |
+| phase16_wl_asp_best | ✅ 0.5 | 0.05 | 1.6738 | 1.7359 | 100/100 |
+| phase16_wl_asp (final) | ✅ 0.5 | 0.05 | 1.6855 | 1.7410 | 100/100 |
+| phase16_wl (final) | ✗ | 0.05 | 1.7012 | 1.7630 | 100/100 |
+| phase16_wl_best | ✗ | 0.05 | 1.7091 | 1.7355 | 100/100 |
+
+**Both changes regressed; neither produced a usable checkpoint.**
+
+**Reproducibility check — phase13's 1.6039 does NOT come from a single fresh 20k run.**
+Re-ran the *exact* phase13 config from scratch (aspect 0.5, no wl, 20k, same seed
+default) → `phase16_repro`. Training curve matched phase13 (cell_acc 0.08–0.13,
+aspect_acc ~0.47), but eval landed higher:
+
+| Checkpoint | Total Score | Avg Cost |
+|---|---|---|
+| phase13_aspect (original) | **1.6039** | 1.6847 |
+| phase16_repro_best | 1.6402 | 1.7419 |
+| phase16_repro (final) | 1.6506 | 1.7356 |
+
+A clean fresh 20k replica tops out at **~1.64–1.65, ~0.04 (≈2.5%) above phase13** —
+consistent across final and best. Conclusion: **phase13's quality is from cumulative
+warm-start across earlier phases, not a single 20k pass.** (Single-seed caveat: some
+of the 0.04 is seed/shuffle variance, but the gap is consistent and this is the
+cleanest possible replica.) Practical consequence: **from-scratch retraining is a dead
+end — any RL fine-tune should warm-start from `phase13_aspect`, the accumulated best,
+not a fresh run.** Note `phase16_repro` (1.6506, no wl) still beats `phase16_wl_asp`
+(1.6855, +wl), re-confirming wl-aux hurts.
+
+1. **Cutting the aspect head was the larger loss.** Keeping aspect (1.6738/1.6855)
+   clearly beats cutting it (1.7012/1.7091). The "aspect is clobbered so it's wasted"
+   reasoning is wrong: the upfront aspect *does* affect how `skyline_legalize` packs
+   the relative arrangement, even when interior blocks get reshaped. **Keep the head.**
+2. **wl-aux(0.05) also hurts.** The only delta between `phase16_wl_asp` and phase13 is
+   wl-aux, and it regressed 1.6039 → 1.6738. This confirms (now from scratch) the
+   earlier warm-start note that wl-aux didn't beat phase13. This soft-argmax form at
+   0.05 is a dead end.
+3. **Train-loss is again a weak proxy (Lesson #6).** `_best` (lower windowed train
+   loss) gave *worse* Total Score than the final checkpoint in the no-aspect pair
+   (1.7091 > 1.7012), and lower Avg Cost but the metrics diverge — train loss does
+   not rank checkpoints by contest cost.
+
+**Conclusion: phase13_aspect's recipe (aspect 0.5, no wl) remains the best BC config;
+the BC + auxiliary-loss network lever is exhausted at the 20k scale.** The properly
+aligned next step is RL fine-tune with **post-legalize** contest cost as the reward
+(BC's target is two layers removed from the score; wl-aux only adds a proxy term that
+still can't see the legalizer). See `README.md` priority list.
+
 ---
 
 ## ML Leverage Points (for future work)
