@@ -14,6 +14,7 @@ needed for this step.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import List, Tuple
 
@@ -43,10 +44,25 @@ def gt_boxes_from_fp(fp_sol: torch.Tensor, block_count: int) -> torch.Tensor:
 
 
 def _target_cell(env: PlacementEnv, x: float, y: float, w: float, h: float) -> int:
-    """GT lower-left (x,y) -> flat grid action, clamped to the feasible region."""
+    """GT box (lower-left x,y + dims w,h) -> flat grid action, clamped to the
+    feasible region. The reference point matches env.anchor (and hence
+    _action_to_xy): "ll" snaps the GT lower-left corner to a cell; "center"
+    snaps the GT CENTER to a cell (size-invariant target)."""
     G = env.grid
     cell_w = env.canvas_w / G
     cell_h = env.canvas_h / G
+    if getattr(env, "anchor", "ll") == "center":
+        # cell center = (col+0.5)*cell_w  ->  col = center/cell_w - 0.5
+        col = int(round((x + w / 2) / cell_w - 0.5))
+        row = int(round((y + h / 2) / cell_h - 0.5))
+        # clamp so the centered block fits (matches the center-mode feasibility mask)
+        min_col = max(int(math.ceil((w / 2) / cell_w - 0.5)), 0)
+        min_row = max(int(math.ceil((h / 2) / cell_h - 0.5)), 0)
+        max_col = min(int((env.canvas_w - w / 2) / cell_w - 0.5), G - 1)
+        max_row = min(int((env.canvas_h - h / 2) / cell_h - 0.5), G - 1)
+        col = min(max(col, min_col), max(max_col, min_col))
+        row = min(max(row, min_row), max(max_row, min_row))
+        return row * G + col
     col = int(round(x / cell_w))
     row = int(round(y / cell_h))
     # clamp so the block fits inside the canvas (matches feasibility mask)

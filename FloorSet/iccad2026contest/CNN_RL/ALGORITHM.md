@@ -1127,3 +1127,85 @@ python3 DL_RL/train_phase8.py --num-samples 1500 --epochs 1 --grid 48
 mv DL_RL/checkpoints/phase8_bc.pt DL_RL/checkpoints/phase8_bc.pt.bak
 python3 iccad2026_evaluate.py --evaluate DL_RL/rl_optimizer.py
 ```
+
+---
+
+## Phase 18 — Center anchoring + ePlace center-refinement (the lever that beat 1.6039)
+
+This session attacked a long-standing artefact: the model places blocks at a grid cell
+interpreted as the **lower-left corner** with origin fixed at (0,0), so a block touching
+the bottom (`y=0`) reports `cy = h/2` — its own **height leaks into the vertical-position
+signal** the skyline sorts on (`order_key` is keyed on `cy`). Two blocks the model "wanted
+at the bottom" get different `cy`, so the shorter one is processed first.
+
+### 18a — Center-anchored action (`PLACE_ANCHOR=center`, `phase18_center.pt`)
+Made the grid cell denote the block **center** (Mirhoseini convention): `cx=(col+½)·cellw`,
+`cy=(row+½)·cellh`, then back out the lower-left. Size-invariant. Touched `placement_env`
+(`_action_to_xy`), `canvas_raster` (`_pull_field` + feasibility in the cell-center frame),
+and the BC target (`pretrain_bc._target_cell` snaps the GT **center**). Retrained 20k
+warm-started from phase13.
+
+| | Total | note |
+|---|---|---|
+| phase13_aspect (cumulative) | **1.6039** | shipped best |
+| phase16_repro (fresh 20k, ll) | 1.6506 | same-budget reference |
+| **phase18_center (center, phase13→20k)** | **1.6406** | equal-budget win vs 1.6506; < 1.6039 |
+
+So center anchoring is a **real equal-budget win** (1.6406 < 1.6506) but a single 20k pass
+can't recover the cumulative 1.6039 (consistent with the "from-scratch tops out ~0.04 worse"
+finding). Win concentrates on small cases (case0 Area_gap 0.54→0.20); large cases flat.
+
+### 18b — Order-preservation is refuted SIX ways (skyline's re-ordering is load-bearing)
+Hypothesis (from the 88/61 swap in case99, where DRL **and GT** agree 61-left-88-right but
+the legalizer flips them): make the legalizer honor the model's relative left/right order.
+Every form regressed (all behind default-off flags in `skyline_shape.py`):
+
+| lever | mechanism | Total |
+|---|---|---|
+| `SKY_LAM` 1.0 / 3.0 | stronger absolute-cx anchor | 1.73 / 1.95 |
+| `ORDER_YLL` | height-invariant queue key (`cy−h/2`) | 1.6395 (flat) |
+| `ORDER_MODE=diag` (cx+cy) | 2D diagonal sweep | 1.7745 |
+| `ORDER_MODE=cx` | pure left→right | 1.8560 |
+| `ORDER_PRESERVE_X` (lower-left) | hard non-crossing x bound | 1.7882 |
+| `ORDER_PRESERVE_X`+`ORDER_EXEMPT_GROUP` | exempt cluster/MIB | 1.7339 |
+
+Diagnostic finding: all of 45/61/88 carry a hard **BOTTOM** boundary (code 8) — they are
+pinned to `y=0` by constraint, not by the frame, so `cy=h/2` is unavoidable and Method A
+(frame liberation) can't move them. case99 also showed `ORDER_PRESERVE_X` **shrinks bbox**
+(4.75e4→4.68e4) but **doubles grouping violations** (V_rel 0.075→0.164) — it breaks cohesion
+clusters. Cluster-exempt removes the violation but also the area win (it came from the cluster
+reshape). **Conclusion: the skyline's freedom to re-order/re-pack is load-bearing for area;
+forcing order always costs more than it saves** (reaffirms Lesson 1's 15.60-vs-2.09).
+
+Method A (centered/liberated frame) was **not built**: it breaks the edge-referenced boundary
+constraints (~46.6% of blocks) and preplaced absolute positions, and the rigid-shift part
+washes out of the translation-invariant legalizer — a re-architecture with provably-flat payoff.
+
+### 18c — Force-directed → ePlace (the win)
+Built a force-directed legalizer prototype (`scratchpad/fd_proto.py`): mass∝area damping,
+HPWL-attraction + overlap-repulsion + boundary + cluster springs, seeded from the DRL raw
+centers. **Naive pairwise repulsion collapses** (case99: bbox 31605, HPWL 827 — *better than
+GT* — but 846 overlaps, a pile). De-overlap over-expands (58k bbox); compaction oscillates.
+The ceiling is real; naive forces can't capture it.
+
+**Mini-ePlace** (`CNN_RL/eplace.py`, vectorised torch, no FFT since n≤120): minimise
+`WL_L1 + λ·density_overflow` by Adam, annealing λ. The smooth density penalty **spreads
+without collapsing** — case99 ePlace-global: **HPWL 1442 < skyline 1891** at similar bbox,
+only 148 overlaps, **2.0s**. Feeding those refined centers into the *existing* skyline
+legalizer (`_rl_centers`, **opt-in `EPLACE=1`**, default OFF — scored pipeline stays phase13+skyline) captures it:
+
+| variant | Total | case0 | case99 | runtime | feasible |
+|---|---|---|---|---|---|
+| phase13_aspect (old baseline) | 1.6039 | ~1.75 | ~1.456 | 0.83s | 100/100 |
+| phase18_center + ePlace | 1.6014 | 1.660 | 1.504 | 1.14s | 100/100 |
+| **phase13 + ePlace (DEFAULT)** | **1.5919** | 1.878 | 1.436 | 0.96s | 100/100 |
+
+**First beat of 1.6039 all session.** Win concentrates on large/dense cases (which dominate
+`e^{n/12}`); small cases regress (case0 1.75→1.88) but are weighted to irrelevance — an
+`EPLACE_MIN_N` block-count gate is **flat** (N=0/50/70 → 1.5919/1.5917/1.5920), don't re-try.
+ePlace params are env-tunable (`EPLACE_FILL/ITERS/LAM0/LAM_GROW/G`).
+
+Runtime caveat: locally neutral (RuntimeFactor pinned 1.0); officially ePlace adds ~0.1–0.3s →
+small `R^0.3` penalty, reducible via fewer iters. The remaining ceiling (ePlace-global HPWL
+1442 vs what skyline keeps) needs a **minimal-displacement legalizer** — the naive de-overlap
+over-expands, so skyline (re-pack) is the current best legalizer for the refined centers.

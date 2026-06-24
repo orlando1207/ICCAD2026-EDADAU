@@ -94,16 +94,24 @@ def _connected_pins(current_block: int,
     return centers, ww
 
 
-def _pull_field(centers, weights, G, cell_w, cell_h, cw, ch, device):
+def _pull_field(centers, weights, G, cell_w, cell_h, cw, ch, device,
+                anchor: str = "ll"):
     """[0,1] field over the G×G grid: high where placing the current block's
     CENTER gives LOW total weighted Manhattan distance to `centers`. Shared by
-    the b2b (wl_pull) and pin (pin_pull) channels."""
+    the b2b (wl_pull) and pin (pin_pull) channels.
+
+    The block-center implied by a cell depends on the action anchoring (must
+    match placement_env._action_to_xy): for "ll" the cell is the lower-left
+    corner so center = corner + (cw/2, ch/2) — size-dependent; for "center" the
+    cell IS the center so center = cell center — size-invariant."""
     centers = centers.to(device)
     weights = weights.to(device)
     cols = torch.arange(G, device=device).float()
     rows = torch.arange(G, device=device).float()
-    cx = (cols * cell_w + cw / 2).view(1, 1, G)       # [1,1,G] block-center x per col
-    cy = (rows * cell_h + ch / 2).view(1, G, 1)       # [1,G,1] block-center y per row
+    ox = cell_w / 2 if anchor == "center" else cw / 2
+    oy = cell_h / 2 if anchor == "center" else ch / 2
+    cx = (cols * cell_w + ox).view(1, 1, G)           # [1,1,G] block-center x per col
+    cy = (rows * cell_h + oy).view(1, G, 1)           # [1,G,1] block-center y per row
     nx = centers[:, 0].view(-1, 1, 1)
     ny = centers[:, 1].view(-1, 1, 1)
     cost = (weights.view(-1, 1, 1)
@@ -122,8 +130,11 @@ def rasterize(positions: torch.Tensor,
               b2b: Optional[torch.Tensor] = None,
               p2b: Optional[torch.Tensor] = None,
               pins: Optional[torch.Tensor] = None,
-              device: str = "cpu") -> torch.Tensor:
-    """Build the [N_CHANNELS, grid, grid] state image. See module docstring."""
+              device: str = "cpu",
+              anchor: str = "ll") -> torch.Tensor:
+    """Build the [N_CHANNELS, grid, grid] state image. See module docstring.
+    `anchor` ("ll"|"center") must match placement_env._action_to_xy so the
+    wl/pin pull and feasibility channels are in the same frame as the action."""
     canvas_w, canvas_h = canvas
     G = grid
     cell_w = canvas_w / G
@@ -159,21 +170,29 @@ def rasterize(positions: torch.Tensor,
         centers, weights = _placed_neighbors(current_block, positions, b2b)
         if centers is not None:
             out[CH_WL_PULL] = _pull_field(centers, weights, G, cell_w, cell_h,
-                                          cw, ch, device)
+                                          cw, ch, device, anchor)
         pin_centers, pin_w = _connected_pins(current_block, p2b, pins)
         if pin_centers is not None:
             out[CH_PIN_PULL] = _pull_field(pin_centers, pin_w, G, cell_w, cell_h,
-                                           cw, ch, device)
+                                           cw, ch, device, anchor)
 
     # --- channel 3: feasibility mask -------------------------------------
     if current_dims is not None:
         cw, ch = current_dims
         cols = torch.arange(G, device=device).float()
         rows = torch.arange(G, device=device).float()
-        x_ll = cols * cell_w
-        y_ll = rows * cell_h
-        col_ok = (x_ll + cw) <= (canvas_w + 1e-6)   # [G]
-        row_ok = (y_ll + ch) <= (canvas_h + 1e-6)   # [G]
+        if anchor == "center":
+            # cell is the block CENTER: feasible iff the block fits centered there
+            # (lower-left = center - dims/2 stays inside [0, canvas]).
+            cx = (cols + 0.5) * cell_w
+            cy = (rows + 0.5) * cell_h
+            col_ok = ((cx - cw / 2) >= -1e-6) & ((cx + cw / 2) <= (canvas_w + 1e-6))
+            row_ok = ((cy - ch / 2) >= -1e-6) & ((cy + ch / 2) <= (canvas_h + 1e-6))
+        else:
+            x_ll = cols * cell_w
+            y_ll = rows * cell_h
+            col_ok = (x_ll + cw) <= (canvas_w + 1e-6)   # [G]
+            row_ok = (y_ll + ch) <= (canvas_h + 1e-6)   # [G]
         out[CH_FEASIBILITY] = (row_ok.view(G, 1) & col_ok.view(1, G)).float()
     else:
         out[CH_FEASIBILITY] = torch.ones((G, G), device=device)
@@ -202,4 +221,5 @@ def rasterize_env(env, device: Optional[str] = None) -> torch.Tensor:
         p2b=getattr(env, "p2b", None),
         pins=getattr(env, "pins_pos", None),
         device=device or env.device,
+        anchor=getattr(env, "anchor", "ll"),
     )

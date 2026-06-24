@@ -102,12 +102,21 @@ def _drl_raw_positions(opt, area_t, b2b, p2b, pins, constraints, otp, block_coun
     return [tuple(float(t) for t in env.positions[i]) for i in range(block_count)]
 
 
-def _draw(ax, pos, title, color, base_area):
+def _draw(ax, pos, title, color, base_area, ids=None):
+    """Draw rectangles; if `ids` is given, label each block with its index at the
+    rectangle centre (so the same block is identifiable across the three panels)."""
     xmin = min(p[0] for p in pos); ymin = min(p[1] for p in pos)
     xmax = max(p[0] + p[2] for p in pos); ymax = max(p[1] + p[3] for p in pos)
-    for (x, y, w, h) in pos:
+    span = max(xmax - xmin, ymax - ymin, 1e-6)
+    if ids is None:
+        ids = list(range(len(pos)))
+    for (x, y, w, h), bid in zip(pos, ids):
         ax.add_patch(Rectangle((x, y), w, h, facecolor=color, edgecolor="black",
                                linewidth=0.4, alpha=0.55))
+        # font scales with block size relative to the panel span, clamped readable
+        fs = max(4.0, min(9.0, 26.0 * min(w, h) / span))
+        ax.text(x + w / 2, y + h / 2, str(bid), ha="center", va="center",
+                fontsize=fs, color="black", zorder=5)
     pad = 0.03 * max(xmax - xmin, ymax - ymin, 1e-6)
     ax.set_xlim(xmin - pad, xmax + pad)
     ax.set_ylim(ymin - pad, ymax + pad)
@@ -173,18 +182,21 @@ def main():
           f"(soft viol {m.total_soft_violations}/{m.max_possible_violations})")
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    all_ids = list(range(block_count))
     if drl is not None:
         _draw(axes[0], drl, f"(1) DRL raw rollout  ovl={_overlap_count(drl)}",
-              "#4C9AFF", base_area)
+              "#4C9AFF", base_area, ids=all_ids)
     else:
         axes[0].set_title("(1) DRL raw rollout\n(no model loaded)")
     _draw(axes[1], legal, f"(2) Legalized  ovl={_overlap_count(legal)}",
-          "#36B37E", base_area)
+          "#36B37E", base_area, ids=all_ids)
     axes[1].set_title(axes[1].get_title() +
                       f"\ncontest cost={m.cost:.3f}  V_rel={m.violations_relative:.3f}"
                       f"  feasible={m.is_feasible}", fontsize=9)
-    _draw(axes[2], [g for g in gt if g[0] >= 0], "(3) Ground truth",
-          "#FF8B00", base_area)
+    # keep original block index for GT (skip invalid/empty blocks)
+    gt_ids = [i for i in range(block_count) if gt[i][0] >= 0]
+    _draw(axes[2], [gt[i] for i in gt_ids], "(3) Ground truth",
+          "#FF8B00", base_area, ids=gt_ids)
 
     fig.suptitle(f"case {args.case}  |  {block_count} blocks", fontsize=12)
     fig.tight_layout()

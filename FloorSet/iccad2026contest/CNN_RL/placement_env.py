@@ -26,6 +26,7 @@ re-derive the scoring formula (VERSION_B_RL_PLACER.md §3).
 from __future__ import annotations
 
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -101,6 +102,14 @@ class PlacementEnv:
         self.grid = grid
         self.area_margin = area_margin
         self.device = device
+        # Action anchoring (see `_action_to_xy`). "ll" (default) = the grid cell
+        # is the block's LOWER-LEFT corner, origin (0,0) at canvas lower-left
+        # (the convention every shipped checkpoint was trained under). "center" =
+        # the cell is the block's CENTER (Mirhoseini-style): size-invariant, so a
+        # bottom-touching block reports the same cy regardless of its height,
+        # removing the height leak into the position signal the skyline sorts on.
+        # Toggle without code edits via PLACE_ANCHOR=center.
+        self.anchor = os.environ.get("PLACE_ANCHOR", "ll").lower()
         # Inference fast-path flags (default off = training/test behaviour). The
         # greedy rollout in RLSkylineOptimizer reads only `current_block` from the
         # state and discards the reward, so the placeholder occupancy grid and the
@@ -241,12 +250,25 @@ class PlacementEnv:
         return x, y
 
     def _action_to_xy(self, action: int, w: float, h: float) -> Tuple[float, float]:
-        """Map a flat grid-cell action to a clamped lower-left (x, y)."""
+        """Map a flat grid-cell action to a clamped lower-left (x, y).
+
+        anchor="ll"     : cell -> lower-left corner (origin (0,0) at canvas LL).
+                          Size-dependent center: cy = row*cell_h + h/2.
+        anchor="center" : cell -> block CENTER (cx,cy at the cell center), then
+                          back out the lower-left. Size-invariant center: a
+                          bottom-row block centers at cell_h/2 whatever its h.
+        """
         row, col = divmod(int(action), self.grid)
         cell_w = self.canvas_w / self.grid
         cell_h = self.canvas_h / self.grid
-        x = col * cell_w
-        y = row * cell_h
+        if self.anchor == "center":
+            cx = (col + 0.5) * cell_w
+            cy = (row + 0.5) * cell_h
+            x = cx - w / 2.0
+            y = cy - h / 2.0
+        else:
+            x = col * cell_w
+            y = row * cell_h
         x = min(max(x, 0.0), max(self.canvas_w - w, 0.0))
         y = min(max(y, 0.0), max(self.canvas_h - h, 0.0))
         return x, y

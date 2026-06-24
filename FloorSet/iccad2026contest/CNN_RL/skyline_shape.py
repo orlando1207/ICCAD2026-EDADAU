@@ -51,12 +51,61 @@ SHAPE_ASPECTS = [0.34, 0.5, 0.7, 1.0, 1.43, 2.0, 2.9]
 # Override via SHAPE_HEIGHT_BETA to re-sweep.
 SHAPE_HEIGHT_BETA = float(os.environ.get("SHAPE_HEIGHT_BETA", "0.3"))
 
+# Experiment: cy-pull in the landing objective (CY_PULL=μ, default 0 = off). The skyline
+# packer is gravity-based — y is forced to the lowest skyline support — so this term can
+# only bias the x-choice toward positions whose landing-y is near the rollout's analytic
+# cy; it cannot lift a block up (that would leave a gap the skyline model can't represent).
+# Tests whether nudging blocks toward their rollout vertical order helps the final cost.
+CY_PULL = float(os.environ.get("CY_PULL", "0.0"))
+# Horizontal-order anchor weight in the landing objective (lam·|x_center − cx|).
+# Default 0.3 = weak tiebreak (landing_y dominates), so the packer freely re-orders
+# blocks left-to-right vs the model's centers. Raise via SKY_LAM to test whether
+# preserving the rollout's relative (left/right) order — which often matches GT —
+# beats the packer's density-first re-ordering.
+SKY_LAM = float(os.environ.get("SKY_LAM", "0.3"))
+# Height-invariant queue order (Method C). The skyline processes blocks by ascending
+# vertical key; default uses the CENTER cy = y + h/2, which for a bottom-touching block
+# (y≈0) collapses to h/2 — so the sort order of blocks on the floor is decided by their
+# HEIGHT, not their intended position (a tall floor block sorts after a short one and is
+# placed later/unfairly). ORDER_YLL=1 sorts by the lower-left edge (cy - h/2 = y instead),
+# so all floor blocks tie at 0 and fall back to left→right cx order.
+ORDER_YLL = os.environ.get("ORDER_YLL", "0") == "1"
+# Method B — relative-order-preserving x bound. The greedy packer drops each block at
+# the lowest-landing x, which lets a block grab a far-left notch and cross to the wrong
+# side of a model-left neighbour (e.g. 88 ending up left of 61). Unlike SKY_LAM (which
+# penalises ABSOLUTE cx deviation and fights density everywhere), this enforces only
+# RELATIVE order: a block's left edge may not go left of any already-placed block the
+# model put to its left in an overlapping vertical band. Density (landing_y) is otherwise
+# untouched, so it only removes left/right CROSSINGS, not tight packing. ORDER_PRESERVE_X=1.
+ORDER_PRESERVE_X = os.environ.get("ORDER_PRESERVE_X", "0") == "1"
+# Cluster/MIB-exempt Method B (default on when B is on): the order bound is applied
+# only among FREE, non-grouped blocks. Grouped members (cohesion cluster / MIB) are
+# neither constrained nor used as a constraint source, so the order constraint can't
+# pull a member out of its cohesion blob (case99: B shrank bbox but doubled grouping
+# violations — this keeps the area win without the violation hit).
+ORDER_EXEMPT_GROUP = os.environ.get("ORDER_EXEMPT_GROUP", "1") == "1"
+# Queue ordering mode (2D-aware sweep experiment). "cy" = vertical (default);
+# "diag" = cx+cy diagonal sweep (lower-left → upper-right); "cx" = pure left→right.
+ORDER_MODE = os.environ.get("ORDER_MODE", "cy")
+
 # Add flush-beside-obstacle x candidates (default ON) so a unit — especially a
 # rigid cluster super-block — can sit next to a preplaced block instead of being
 # bumped *over* it. The skyline only tracks the top contour, so without these the
 # packer never sees the gap beside a floating preplaced obstacle. All 100 cases
 # have preplaced+cluster; this drops Total Score 1.8032→1.7608 at no runtime cost.
 OBS_XCAND = os.environ.get("OBS_XCAND", "1") == "1"
+
+# Ceiling-lift (TOP two-pass): after packing, lift each TOP-forced block straight up
+# to touch the pack top whenever the strip above it is empty. MEASURED NET LOSS, so
+# default OFF: the naive "fix all top boundary" headroom (~0.09 Total) assumed free
+# fixes, but the violations are geometrically locked — only 4/218 had an empty strip
+# (inter-top stacking blocks the rest), and those few lifts pulled blocks off their
+# nets, raising HPWL/area more than the V drop saved (Total 1.6039→1.6011, avg cost
+# 1.6847→1.6897 worse). Kept behind TOP_LIFT=1 for reference. The real top lever would
+# need a placement-level rewrite (reserve top blocks, tile along a common ceiling) and
+# would still pay the same HPWL relocation cost — likely the boundary lever is much
+# smaller than the static estimate implied.
+TOP_LIFT = os.environ.get("TOP_LIFT", "0") == "1"
 
 
 # Cluster super-block aspect ladder: row-width multipliers on sqrt(cluster_area).
@@ -235,19 +284,27 @@ def _pack_one_width_shaped(movable, obstacles, W: float, lam: float,
             return blocks[u.key[1]].cluster_group
         return 0
 
+    def _ykey(u):                                  # primary queue-sort key
+        if ORDER_MODE == "diag":
+            return u.cx + u.cy                     # 2D diagonal sweep
+        if ORDER_MODE == "cx":
+            return u.cx                            # left → right
+        return (u.cy - u.h / 2.0) if ORDER_YLL else u.cy   # vertical (Method C)
+
     grp_anchor: Dict[int, float] = {}
     if cohesion:
         for u in movable:
             g = _coh_grp(u)
             if g:
-                grp_anchor[g] = min(grp_anchor.get(g, u.cy), u.cy)
+                grp_anchor[g] = min(grp_anchor.get(g, _ykey(u)), _ykey(u))
 
     def order_key(u):
         bottom = 1 if (u.bc & BOUND_BOTTOM) else 0
         top = 1 if (u.bc & BOUND_TOP) else 0
         g = _coh_grp(u)
-        anchor = grp_anchor.get(g, u.cy) if g else u.cy
-        return (-bottom, top, anchor, g, u.cy, u.cx)
+        yk = _ykey(u)
+        anchor = grp_anchor.get(g, yk) if g else yk
+        return (-bottom, top, anchor, g, yk, u.cx)
 
     placed_by_group: Dict[int, List[Tuple[float, float, float, float]]] = {}
 
@@ -262,9 +319,46 @@ def _pack_one_width_shaped(movable, obstacles, W: float, lam: float,
             best = min(best, gx + gy)
         return best
 
+    placed_units: List = []                            # (unit, left_x) for Method B
+
+    def _grouped(u):
+        """Cohesion-cluster or MIB member (an individual 'b' unit with a group).
+        Rigid cluster super-blocks (is_cluster) are NOT grouped here — they move as
+        one piece, so order-constraining them can't break internal cohesion."""
+        if getattr(u, "is_cluster", False):
+            return False
+        if blocks is not None and isinstance(u.key, tuple) and u.key[0] == "b":
+            b = blocks[u.key[1]]
+            return b.cluster_group != 0 or b.mib_group != 0
+        return False
+
+    def _order_xlb(u):
+        """Method B: lowest legal left-x for u that preserves the model's relative
+        left/right order. u may not start left of any already-placed v that the model
+        put to u's left (v.cx < u.cx) within an overlapping vertical band."""
+        if not ORDER_PRESERVE_X or (u.bc & (BOUND_LEFT | BOUND_RIGHT)):
+            return 0.0
+        if ORDER_EXEMPT_GROUP and _grouped(u):         # don't pull grouped members
+            return 0.0
+        # All comparisons in LOWER-LEFT corner coords (the model's raw anchor), not the
+        # width/height-contaminated center: lx = cx - w/2, ly = cy - h/2.
+        u_lx = u.cx - u.w / 2.0
+        ut, ub = u.cy + u.h / 2.0, u.cy - u.h / 2.0    # u's y-extent [ly, ly+h]
+        lb = 0.0
+        for (v, vbx) in placed_units:
+            if ORDER_EXEMPT_GROUP and _grouped(v):     # grouped blocks aren't sources
+                continue
+            if (v.cx - v.w / 2.0) < u_lx - 1e-9:       # model: v's LL corner left of u's
+                vt, vb = v.cy + v.h / 2.0, v.cy - v.h / 2.0
+                if vb < ut - 1e-9 and ub < vt - 1e-9:  # y-extents overlap (same band)
+                    if vbx > lb:
+                        lb = vbx
+        return lb
+
     placement: Dict = {}
     for u in sorted(movable, key=order_key):
         gid = _mib_of(u)
+        x_lb = _order_xlb(u)                            # Method B left bound (0 if off)
         reshapeable = u.soft and (not u.is_cluster) and (u.bc == 0)
         if gid != 0:                                      # MIB member: coupled reshape
             aspects = ([group_aspect[gid]] if gid in group_aspect else SHAPE_ASPECTS)
@@ -313,12 +407,18 @@ def _pack_one_width_shaped(movable, obstacles, W: float, lam: float,
                         for xc in (ox - w, ox + ow):
                             if -1e-6 <= xc <= W - w + 1e-6:
                                 cands.append(min(max(xc, 0.0), W - w))
+                if ORDER_PRESERVE_X and x_lb > 1e-9:    # Method B: drop crossing x's
+                    cands = [x for x in cands if x >= x_lb - 1e-6]
+                    if not cands:
+                        cands = [min(max(x_lb, 0.0), W - w)]
             for x in cands:
                 x = min(x, W - w)
                 if x < -1e-9:
                     x = 0.0
                 y = _land_y(x, w, h)
                 score = y + SHAPE_HEIGHT_BETA * h + lam * abs((x + w / 2.0) - u.cx)
+                if CY_PULL > 0.0:                       # bias toward rollout vertical order
+                    score += CY_PULL * abs((y + h / 2.0) - u.cy)
                 if cohesion:
                     cg_id = _coh_grp(u)
                     if cg_id:
@@ -337,10 +437,48 @@ def _pack_one_width_shaped(movable, obstacles, W: float, lam: float,
             group_aspect[gid] = ba                        # commit shared aspect
         sky.raise_to(bx, bx + bw, by + bh)
         placement[u.key] = (bx, by, bw, bh)
+        if ORDER_PRESERVE_X:
+            placed_units.append((u, bx))               # Method B: record left edge
         if cohesion:
             cg_id = _coh_grp(u)
             if cg_id:
                 placed_by_group.setdefault(cg_id, []).append((bx, by, bw, bh))
+
+    # Ceiling-lift (TOP two-pass): TOP-forced blocks are placed last (order_key) and
+    # land on the contour at whatever local height — usually short of the global pack
+    # top H, so they violate their boundary. Nothing is placed above them, so lift
+    # each up to touch H whenever the column strip above it is empty. Fixes the
+    # violation without growing the bbox (H unchanged) and without overlap risk
+    # (strip verified free). x and shape are untouched, so LEFT/RIGHT corner contact
+    # (T+L, T+R) is preserved; skip T+B (can't satisfy both by lifting).
+    if TOP_LIFT and placement:
+        H = max(y + h for (_, y, _, h) in placement.values())
+        obst = [(ox, oy, ow, oh) for (ox, oy, ow, oh, _) in obstacles]
+        top_keys = [u.key for u in movable
+                    if (u.bc & BOUND_TOP) and not (u.bc & BOUND_BOTTOM)]
+        # lift the highest-topped first so a lower top block can't block a higher one
+        top_keys.sort(key=lambda k: -(placement[k][1] + placement[k][3]))
+        for k in top_keys:
+            x, y, w, h = placement[k]
+            if abs((y + h) - H) < 1e-6:
+                continue                                   # already touches the top
+            y0 = y + h
+            free = True
+            for kk, (xj, yj, wj, hj) in placement.items():
+                if kk == k:
+                    continue
+                if (min(x + w, xj + wj) - max(x, xj) > 1e-6 and
+                        min(H, yj + hj) - max(y0, yj) > 1e-6):
+                    free = False
+                    break
+            if free:
+                for (ox, oy, ow, oh) in obst:
+                    if (min(x + w, ox + ow) - max(x, ox) > 1e-6 and
+                            min(H, oy + oh) - max(y0, oy) > 1e-6):
+                        free = False
+                        break
+            if free:
+                placement[k] = (x, H - h, w, h)
 
     return placement
 
@@ -350,7 +488,7 @@ def skyline_legalize_shaped(
     super_blocks: Dict[int, SuperBlock],
     cluster_groups: Dict[int, List[int]],
     cx, cy, area_targets,
-    lam: float = 0.3, b2b=None, p2b=None, pins=None, mib_shape: bool = False,
+    lam: float = SKY_LAM, b2b=None, p2b=None, pins=None, mib_shape: bool = False,
     cluster_shape: bool = False, cohesion: bool = False,
 ) -> Tuple[List[Tuple[float, float, float, float]], float]:
     """Stock `skyline_legalize` width-ladder + square/row modes, PLUS a contour-
@@ -371,7 +509,12 @@ def skyline_legalize_shaped(
         if b.boundary_code & BOUND_TOP or b.boundary_code & BOUND_BOTTOM:
             sw_tb += b.w
     asp_pred = min(max(sh_lr / sw_tb, 0.3), 3.2)
-    PRIOR = 0.5
+    # Weight of the aspect-prior regularizer in the area-proxy gate. This biases width
+    # selection toward asp_pred and is NOT part of the contest cost, so at 0.5 it was
+    # over-constraining the area/HPWL trade. A 100-case sweep found a basin at
+    # 0.25–0.35 (0.3 → Total 1.5972 vs 0.5 → 1.6039, both HPWL & area improve weighted);
+    # past 0.5 it degrades (1.0 → 1.6245). Override via ASPECT_PRIOR to re-sweep.
+    PRIOR = float(os.environ.get("ASPECT_PRIOR", "0.3"))
 
     if movable:
         ax_min = min(u.cx - u.w / 2.0 for u in movable)

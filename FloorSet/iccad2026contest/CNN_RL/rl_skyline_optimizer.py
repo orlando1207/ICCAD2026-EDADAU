@@ -77,7 +77,7 @@ class RLSkylineOptimizer(FloorplanOptimizer):
         self.aspect_pass = aspect_pass          # predict soft-block aspect ratio (Phase 13)
         self.shape_fit = shape_fit              # contour-aware in-packer shaping (Phase 15/B1)
         self.b2_pass = b2_pass                  # critical-path slack shaping (Phase 15/B2)
-        self.boundary_pass = boundary_pass      # TOP/RIGHT boundary reshape (Item A)
+        self.boundary_pass = boundary_pass or os.environ.get("BOUNDARY_PASS", "0") == "1"  # TOP/RIGHT boundary reshape (Item A)
         self.mib_shape = mib_shape              # reshape free MIB groups (Item B-MIB, net loss)
         import os                               # re-pack cluster super-blocks (Item B-cluster)
         self.cluster_shape = cluster_shape or os.environ.get("CLUSTER_SHAPE", "0") == "1"
@@ -155,10 +155,30 @@ class RLSkylineOptimizer(FloorplanOptimizer):
 
         cx = np.zeros(block_count, dtype=np.float64)
         cy = np.zeros(block_count, dtype=np.float64)
+        dims = np.zeros((block_count, 2), dtype=np.float64)
         for i in range(block_count):
             x, y, w, h = (float(t) for t in env.positions[i])
             cx[i] = x + w / 2.0
             cy[i] = y + h / 2.0
+            dims[i] = (w, h)
+        # ePlace center refinement (EPLACE=1): analytical WL+density global placement
+        # on the rollout centers before the skyline legalizer re-packs them. Off by
+        # default; the legalizer/feasibility path is otherwise untouched.
+        import os
+        # ePlace center refinement (OPT-IN: EPLACE=1) — analytical WL+density refinement of
+        # the rollout centers before skyline re-packs (win: phase13 1.6039→1.5919). Default
+        # OFF so the scored pipeline stays phase13+skyline. EPLACE_MIN_N gates to count>=N.
+        _emin = int(os.environ.get("EPLACE_MIN_N", "0"))
+        if os.environ.get("EPLACE", "0") == "1" and block_count >= _emin:
+            try:
+                from eplace import eplace_refine
+                areas = np.array([max(float(area_targets[i]), 1e-3)
+                                  for i in range(block_count)])
+                pmask = np.array([bool(float(constraints[i, 1]) > 0)
+                                  for i in range(block_count)])
+                cx, cy = eplace_refine(cx, cy, dims, areas, b2b, p2b, pins, pmask)
+            except Exception as e:  # pragma: no cover
+                print(f"[ePlace] refine failed ({e}); using rollout centers")
         return cx, cy, aspect_choice
 
     @staticmethod
@@ -338,6 +358,20 @@ class RLSkylineOptimizer(FloorplanOptimizer):
             p = enforce_hard(p, blocks, area_targets)
             return _detailed_place(p, blocks, b2b_connectivity,
                                    p2b_connectivity, pins_pos)
+
+        # Experiment: topology-preserving legalize (TOPO_LEGALIZE=1). Instead of the
+        # gravity-based skyline re-pack (which discards the rollout's relative order),
+        # derive a cycle-free HCG/VCG *directly from the rollout centers* and pack via
+        # longest-path — so block i stays left-of/below-of j exactly as the rollout
+        # arranged them. Overlap-free by construction; no shaping/gate.
+        import os as _os
+        if _os.environ.get("TOPO_LEGALIZE", "0") == "1":
+            from legalizer.topology import build_topology, longest_path_pack
+            hcg, vcg = build_topology(np.asarray(cx, dtype=np.float64),
+                                      np.asarray(cy, dtype=np.float64),
+                                      blocks, super_blocks, cluster_groups)
+            p = longest_path_pack(hcg, vcg, blocks, super_blocks, cluster_groups)
+            return _finish(p)
 
         # The reshape variants only differ from the default when the problem has a
         # cluster that is actually reshapeable (plain shelf-packed: every member is
