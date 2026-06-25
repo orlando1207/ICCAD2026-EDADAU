@@ -84,9 +84,9 @@ class Skyline:
 
 class _Unit:
     """A thing to place: a free block or a rigid cluster box."""
-    __slots__ = ("w", "h", "cx", "cy", "bc", "is_cluster", "key")
+    __slots__ = ("w", "h", "cx", "cy", "bc", "is_cluster", "key", "soft", "area")
 
-    def __init__(self, w, h, cx, cy, bc, is_cluster, key):
+    def __init__(self, w, h, cx, cy, bc, is_cluster, key, soft=False, area=None):
         self.w = w
         self.h = h
         self.cx = cx
@@ -94,6 +94,8 @@ class _Unit:
         self.bc = bc
         self.is_cluster = is_cluster
         self.key = key  # block index, or cluster gid
+        self.soft = soft
+        self.area = float(area if area is not None else w * h)
 
 
 def _build_units(
@@ -102,6 +104,7 @@ def _build_units(
     cluster_groups: Dict[int, List[int]],
     cx: np.ndarray,
     cy: np.ndarray,
+    area_targets,
 ) -> Tuple[List[_Unit], List[Tuple[float, float, float, float, int]]]:
     """Return (movable_units, preplaced_obstacles).
 
@@ -131,11 +134,36 @@ def _build_units(
         if b.is_preplaced:
             obstacles.append((b.fixed_x, b.fixed_y, b.w, b.h, i))
             continue
+        soft = (not b.is_fixed_shape) and b.mib_group == 0
+        area = float(area_targets[i]) if area_targets is not None else b.w * b.h
         movable.append(_Unit(
             w=b.w, h=b.h, cx=float(cx[i]), cy=float(cy[i]),
             bc=b.boundary_code, is_cluster=False, key=("b", i),
+            soft=soft, area=area,
         ))
     return movable, obstacles
+
+
+def _shape_options(u: _Unit) -> List[Tuple[float, float]]:
+    """Small area-preserving bucket list for boundary soft blocks."""
+    if not (u.soft and (u.bc & (BOUND_BOTTOM | BOUND_TOP))):
+        return [(u.w, u.h)]
+
+    opts = [(u.w, u.h)]
+    for aspect in (0.5, 0.75, 1.0, 1.3333333333, 2.0):
+        w = math.sqrt(max(u.area, 1e-9) * aspect)
+        h = max(u.area, 1e-9) / w
+        opts.append((w, h))
+
+    deduped = []
+    seen = set()
+    for w, h in opts:
+        key = (round(w, 6), round(h, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((w, h))
+    return deduped
 
 
 def _pack_one_width(
@@ -145,7 +173,7 @@ def _pack_one_width(
     lam: float,
 ) -> Optional[Dict]:
     """One deterministic packing pass at width W. Returns a placement dict
-    {unit_key: (x, y)} for movable units, or None if infeasible at this W."""
+    {unit_key: (x, y, w, h)} for movable units, or None if infeasible at this W."""
     if any(u.w > W + 1e-6 for u in movable):
         return None
     for (ox, oy, ow, oh, _) in obstacles:
@@ -175,35 +203,60 @@ def _pack_one_width(
     def order_key(u: _Unit):
         bottom = 1 if (u.bc & BOUND_BOTTOM) else 0
         top = 1 if (u.bc & BOUND_TOP) else 0
-        return (-bottom, top, u.cy, u.cx)
+        corner = 1 if (
+            (u.bc & (BOUND_LEFT | BOUND_RIGHT)) and
+            (u.bc & (BOUND_TOP | BOUND_BOTTOM))
+        ) else 0
+        boundary = 1 if u.bc else 0
+        return (-bottom, top, -corner, -boundary, u.cy, u.cx)
 
     placement: Dict = {}
     for u in sorted(movable, key=order_key):
-        if u.bc & BOUND_LEFT:
-            cands = [0.0]
-        elif u.bc & BOUND_RIGHT:
-            cands = [max(0.0, W - u.w)]
-        else:
-            cands = sky.candidate_xs(u.w)
-
         best_x = None
+        best_w = u.w
+        best_h = u.h
         best_score = float("inf")
         best_y = 0.0
-        for x in cands:
-            x = min(x, W - u.w)
-            if x < -1e-9:
-                x = 0.0
-            y = _land_y(x, u.w, u.h)
-            score = y + lam * abs((x + u.w / 2.0) - u.cx)
-            if score < best_score - 1e-9:
-                best_score = score
-                best_x = x
-                best_y = y
+        for w, h in _shape_options(u):
+            if w > W + 1e-6:
+                continue
+            if u.bc & BOUND_LEFT:
+                cands = [0.0]
+            elif u.bc & BOUND_RIGHT:
+                cands = [max(0.0, W - w)]
+            else:
+                cands = sky.candidate_xs(w)
+                if u.bc & (BOUND_BOTTOM | BOUND_TOP):
+                    for ox, _, ow, _, _ in obstacles:
+                        cands.extend((ox, ox + ow, ox - w, ox + ow - w))
+                    deduped = []
+                    seen = set()
+                    for cand in cands:
+                        cand = min(max(0.0, cand), W - w)
+                        key = round(cand, 6)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        deduped.append(cand)
+                    cands = deduped
+
+            for x in cands:
+                x = min(x, W - w)
+                if x < -1e-9:
+                    x = 0.0
+                y = _land_y(x, w, h)
+                score = y + lam * abs((x + w / 2.0) - u.cx)
+                if score < best_score - 1e-9:
+                    best_score = score
+                    best_x = x
+                    best_y = y
+                    best_w = w
+                    best_h = h
         if best_x is None:
             best_x, best_y = 0.0, _land_y(0.0, u.w, u.h)
 
-        sky.raise_to(best_x, best_x + u.w, best_y + u.h)
-        placement[u.key] = (best_x, best_y)
+        sky.raise_to(best_x, best_x + best_w, best_y + best_h)
+        placement[u.key] = (best_x, best_y, best_w, best_h)
 
     return placement
 
@@ -244,13 +297,13 @@ def _materialize(
         elif i in cluster_of:
             gid = cluster_of[i]
             sb = super_blocks[gid]
-            X, Y = placement[("c", gid)]
+            X, Y, _, _ = placement[("c", gid)]
             mi = sb.members.index(i)
             dx, dy = sb.offsets[mi]
             pos[i] = (X + dx, Y + dy, b.w, b.h)
         else:
-            X, Y = placement[("b", i)]
-            pos[i] = (X, Y, b.w, b.h)
+            X, Y, Wq, Hq = placement[("b", i)]
+            pos[i] = (X, Y, Wq, Hq)
     return pos
 
 
@@ -265,7 +318,7 @@ def skyline_legalize(
 ) -> Tuple[List[Tuple[float, float, float, float]], float]:
     """Legalize via skyline packing. Tries a ladder of container widths and
     returns (positions, score) for the best (lowest cost-proxy) feasible width."""
-    movable, obstacles = _build_units(blocks, super_blocks, cluster_groups, cx, cy)
+    movable, obstacles = _build_units(blocks, super_blocks, cluster_groups, cx, cy, area_targets)
 
     total_area = sum(u.w * u.h for u in movable) + sum(o[2] * o[3] for o in obstacles)
     max_unit_w = max((u.w for u in movable), default=1.0)
@@ -284,9 +337,19 @@ def skyline_legalize(
     else:
         analytic_aspect = 1.0
 
+    sh_lr, sw_tb = 1e-6, 1e-6
+    for b in blocks:
+        bc = b.boundary_code
+        if bc & BOUND_LEFT or bc & BOUND_RIGHT:
+            sh_lr += b.h
+        if bc & BOUND_TOP or bc & BOUND_BOTTOM:
+            sw_tb += b.w
+    asp_pred = min(max(sh_lr / sw_tb, 0.3), 3.2)
+    PRIOR = 0.5
+
     # aspect = height/width: <1 = wide/short, >1 = tall/narrow. Include both so a
     # wide container can win when the instance prefers it (the score proxy selects).
-    aspects = [analytic_aspect, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
+    aspects = [analytic_aspect, asp_pred, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
     cand_W = set()
     for asp in aspects:
         asp = max(asp, 1e-3)
@@ -306,6 +369,8 @@ def skyline_legalize(
         y2 = max(p[1] + p[3] for p in pos)
         bv = _count_boundary_unmet(pos, blocks, x2, y2)
         score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
+        cand_aspect = y2 / max(x2, 1e-6)
+        score *= 1.0 + PRIOR * abs(math.log(cand_aspect / asp_pred))
         if score < best_score:
             best_score = score
             best_pos = pos
@@ -317,15 +382,6 @@ def skyline_legalize(
         x2 = max(p[0] + p[2] for p in best_pos)
         y2 = max(p[1] + p[3] for p in best_pos)
         best_score = x2 * y2
-
-    # Finetune: tuck bbox-defining free blocks into cluster-internal whitespace
-    # to shrink the bbox (grouping unaffected — a non-member in a group's gap does
-    # not change that group's connectivity).
-    best_pos = _finetune_fill_gaps(best_pos, blocks, cluster_groups)
-    x2 = max(p[0] + p[2] for p in best_pos)
-    y2 = max(p[1] + p[3] for p in best_pos)
-    bv = _count_boundary_unmet(best_pos, blocks, x2, y2)
-    best_score = (x2 * y2) * math.exp(2.0 * bv / max(n, 1))
 
     return best_pos, best_score
 

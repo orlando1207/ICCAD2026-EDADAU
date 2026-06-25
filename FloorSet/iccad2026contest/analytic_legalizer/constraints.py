@@ -272,9 +272,20 @@ def _boundary_aware_pack(
     def has(c, bit):
         return c & bit
 
-    bottom = [i for i in range(n) if has(codes[i], BOUND_BOTTOM)]
-    top    = [i for i in range(n) if has(codes[i], BOUND_TOP) and not has(codes[i], BOUND_BOTTOM)]
-    used = set(bottom) | set(top)
+    bl = [i for i in range(n) if has(codes[i], BOUND_BOTTOM) and has(codes[i], BOUND_LEFT)]
+    br = [i for i in range(n) if has(codes[i], BOUND_BOTTOM) and has(codes[i], BOUND_RIGHT)
+          and i not in bl]
+    bottom = [i for i in range(n) if has(codes[i], BOUND_BOTTOM)
+              and i not in bl and i not in br]
+
+    tl = [i for i in range(n) if has(codes[i], BOUND_TOP) and has(codes[i], BOUND_LEFT)
+          and not has(codes[i], BOUND_BOTTOM)]
+    tr = [i for i in range(n) if has(codes[i], BOUND_TOP) and has(codes[i], BOUND_RIGHT)
+          and i not in tl and not has(codes[i], BOUND_BOTTOM)]
+    top = [i for i in range(n) if has(codes[i], BOUND_TOP)
+           and not has(codes[i], BOUND_BOTTOM) and i not in tl and i not in tr]
+
+    used = set(bl) | set(br) | set(bottom) | set(tl) | set(tr) | set(top)
     left  = [i for i in range(n) if i not in used and has(codes[i], BOUND_LEFT)]
     right = [i for i in range(n) if i not in used and has(codes[i], BOUND_RIGHT)
              and not has(codes[i], BOUND_LEFT)]
@@ -283,8 +294,10 @@ def _boundary_aware_pack(
 
     offsets: List[Tuple[float, float]] = [(0.0, 0.0)] * n
 
-    bottom_h = max((heights[i] for i in bottom), default=0.0)
-    top_h    = max((heights[i] for i in top),    default=0.0)
+    bottom_band = bl + bottom + br
+    top_band = tl + top + tr
+    bottom_h = max((heights[i] for i in bottom_band), default=0.0)
+    top_h    = max((heights[i] for i in top_band),    default=0.0)
     left_w   = max((widths[i]  for i in left),   default=0.0)
     right_w  = max((widths[i]  for i in right),  default=0.0)
 
@@ -300,21 +313,35 @@ def _boundary_aware_pack(
     right_h = sum(heights[i] for i in right)
     middle_h = max(center_h, left_h, right_h, 0.0)
     middle_w = left_w + center_w + right_w
-    bottom_w = sum(widths[i] for i in bottom)
-    top_w    = sum(widths[i] for i in top)
+    bottom_w = sum(widths[i] for i in bottom_band)
+    top_w    = sum(widths[i] for i in top_band)
     sb_w = max(middle_w, bottom_w, top_w, 1e-6)
     sb_h = bottom_h + middle_h + top_h
 
     # Bottom row at y=0, left→right.
     x = 0.0
+    for i in bl:
+        offsets[i] = (x, 0.0)
+        x += widths[i]
     for i in bottom:
         offsets[i] = (x, 0.0)
         x += widths[i]
+    x = sb_w
+    for i in reversed(br):
+        x -= widths[i]
+        offsets[i] = (x, 0.0)
     # Top row flush to the top.
     x = 0.0
+    for i in tl:
+        offsets[i] = (x, sb_h - heights[i])
+        x += widths[i]
     for i in top:
         offsets[i] = (x, sb_h - heights[i])
         x += widths[i]
+    x = sb_w
+    for i in reversed(tr):
+        x -= widths[i]
+        offsets[i] = (x, sb_h - heights[i])
     # Left column at x=0, stacked upward in the middle band.
     y = bottom_h
     for i in left:

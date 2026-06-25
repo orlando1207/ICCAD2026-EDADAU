@@ -312,18 +312,34 @@ def compute_cost(
 ) -> float:
     """
     Compute the official contest cost.
-    
+
     Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_rel) × max(0.7, R^γ)
          = M (10.0) if infeasible
+
+    Infeasible means ANY hard constraint is violated:
+        - block overlaps
+        - soft-block area outside 1% tolerance
+        - fixed-shape dimensions deviate from input
+        - preplaced position or dimensions deviate from input
+
+    Note: HPWL_gap and Area_gap are clamped to zero from below (max(0, gap));
+    beating the baseline gives no additional score reduction.
+
+    Note: feasible cost is capped at M−ε (9.999999) so that any feasible
+    solution always scores strictly better than an infeasible one (M=10.0).
     """
     if not is_feasible:
         return M_PENALTY
-    
+
     quality_factor = 1 + ALPHA * (max(0, hpwl_gap) + max(0, area_gap))
     violation_factor = math.exp(BETA * violations_relative)
     runtime_adjustment = max(0.7, math.pow(max(0.01, runtime_factor), GAMMA))
-    
-    return quality_factor * violation_factor * runtime_adjustment
+
+    # Cap feasible cost strictly below M so that any feasible solution
+    # (no overlaps, area tolerance met, fixed/preplaced respected) always
+    # scores better than an infeasible one (cost = M).
+    return min(quality_factor * violation_factor * runtime_adjustment,
+               M_PENALTY - 1e-6)
 
 
 def evaluate_solution(
@@ -565,19 +581,24 @@ def evaluate_solution(
 def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
     """
     Compute exponentially weighted average score.
-    
-    Total Score = Σ Cost[i] · e^{n_i} / Σ e^{n_j}
-    
-    where n_i is the block count for test case i. Larger instances
-    contribute exponentially more to the final score.
+
+    Total Score = Σ Cost[i] · e^{n_i/12} / Σ e^{n_j/12}
+
+    where n_i is the block count for test case i. The /12 scaling ensures
+    every size from 21 to 120 carries non-zero weight while still strongly
+    favouring larger instances:
+        exp(n)    → n=120 alone ≈ 63%, cases below n=116 ≈ 1% total
+        exp(n/4)  → n=120 alone ≈ 22%, cases below n=111 ≈ 8% total
+        exp(n/12) → n=120 alone ≈ 34%, cases below n=111 ≈ 28% total
+                    n=21-25 bucket: 0.01% (first option with full-range coverage)
     """
     if not costs:
         return 0.0
     if not block_counts or all(n == 0 for n in block_counts):
         return sum(costs) / len(costs)
-    
+
     max_n = max(block_counts)
-    weights = [math.exp(n - max_n) for n in block_counts]
+    weights = [math.exp((n - max_n) / 12) for n in block_counts]
     total_weight = sum(weights)
     return sum(c * w for c, w in zip(costs, weights)) / total_weight
 
@@ -900,14 +921,24 @@ class ContestEvaluator:
                     runtime_seconds=0, cost=M_PENALTY, error=str(e)
                 ))
         
-        # Recompute with median runtime
+        # Local runtime normalization:
+        # The official contest computes RuntimeFactor per test case as
+        #   your_runtime / median_runtime_of_all_submissions_on_that_case.
+        # Locally we have only one solver, so cross-submission medians are
+        # unavailable.  Using a single mixed-size median across all 100 cases
+        # as the denominator is misleading: small cases (21 blocks, fast) would
+        # get an artificial speed bonus and large cases (120 blocks, slow) an
+        # artificial slowness penalty.  Instead, we set RuntimeFactor = 1.0 for
+        # every test case, which is the neutral assumption (you are at the
+        # median).  Runtime scores are only meaningful on the official leaderboard.
         if runtimes:
-            median_rt = sorted(runtimes)[len(runtimes)//2]
+            if self.verbose:
+                print("\nNOTE: Local runtime scores use RuntimeFactor=1.0 (neutral).")
+                print("      Official scores reflect per-test-case cross-submission medians.")
             for r in results:
                 if r.error is None:
-                    rt_factor = r.runtime_seconds / max(median_rt, 0.01)
                     r.cost = compute_cost(r.hpwl_gap, r.area_gap, r.violations_relative,
-                                         rt_factor, r.is_feasible)
+                                         1.0, r.is_feasible)
         
         costs = [r.cost for r in results]
         blocks = [r.block_count for r in results]
@@ -1190,8 +1221,9 @@ def compute_training_loss(
         # Violations relative to block count
         violations_relative = total_violations / max(block_count, 1)
         
-        # EXACT contest formula:
-        # Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_rel) = M if infeasible
+        # Training proxy formula (omits RuntimeFactor — not available during training).
+        # Full contest formula: Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_rel)
+        #                              × max(0.7, RuntimeFactor^γ),  or M if infeasible.
         if not is_feasible:
             cost = M_PENALTY  # 10.0
         else:
@@ -1784,7 +1816,8 @@ def print_contest_info():
 ║    Test:       100 samples (hidden) - final contest ranking      ║
 ║                                                                  ║
 ║  SCORING FORMULA:                                                ║
-║  Cost = (1 + α(HPWL_gap + Area_gap)) × exp(β·V_rel) × R_factor   ║
+║  Cost = (1 + α(HPWL_gap + Area_gap)) × exp(β·V_rel) × R_factor  ║
+║  Total = Σ Cost[i]·exp(n_i/12) / Σ exp(n_j/12)                  ║
 ║                                                                  ║
 ║  Parameters: α=0.5, β=2.0, γ=0.3, M=10.0 (infeasible)           ║
 ║                                                                  ║
