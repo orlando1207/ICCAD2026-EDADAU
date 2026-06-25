@@ -8,10 +8,10 @@ is visible. Saves one PNG per case.
 
 Usage (from iccad2026contest/):
     # 1) produce solutions
-    python ml-engine/gt_dims_harness.py all --budget 20 --starts 12 --save sols.json
+    python sp-engine/gt_dims_harness.py all --budget 20 --starts 12 --save sols.json
     # 2) render some cases (ids, or 'all')
-    python ml-engine/visualize_solution.py sols.json 99 95 50
-    python ml-engine/visualize_solution.py sols.json all --out viz/
+    python sp-engine/visualize_solution.py sols.json 99 95 50
+    python sp-engine/visualize_solution.py sols.json all --out viz/
 """
 
 import json
@@ -119,10 +119,10 @@ def main(sols_path, ids, out_dir):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    out = "ml-engine/viz"
+    out = "sp-engine/viz"
     if "--out" in args:
         k = args.index("--out"); out = args[k + 1]; del args[k:k + 2]
     if not args:
-        print("usage: python ml-engine/visualize_solution.py SOLS.json <ids|all> [--out DIR]")
+        print("usage: python sp-engine/visualize_solution.py SOLS.json <ids|all> [--out DIR]")
         sys.exit(1)
     main(args[0], args[1:] or ["all"], out)

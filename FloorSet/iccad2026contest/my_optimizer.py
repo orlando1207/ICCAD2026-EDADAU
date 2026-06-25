@@ -7,8 +7,8 @@ import sys
 import os
 from pathlib import Path
 
-# Add ml-engine to path so SPFloorplanner imports work
-_ML_ENGINE = Path(__file__).parent / 'ml-engine'
+# Add sp-engine to path so SPFloorplanner imports work
+_ML_ENGINE = Path(__file__).parent / 'sp-engine'
 if str(_ML_ENGINE) not in sys.path:
     sys.path.insert(0, str(_ML_ENGINE))
 

@@ -12,11 +12,11 @@ solve_with_dims() for correct SA cost normalisation — this is purely internal
 to the SA and does NOT give the solver any GT positional information.
 
 Usage (from FloorSet/iccad2026contest/):
-    python ml-engine/sp_harness.py                   # cases 95-99
-    python ml-engine/sp_harness.py all               # all 100
-    python ml-engine/sp_harness.py all --budget 20 --starts 12 --save sp_sols.json
-    python ml-engine/sp_harness.py 95 99 --no-rot    # ablation: rotation off
-    python ml-engine/sp_harness.py 95 99 --aspect 2  # try 2:1 initial shapes
+    python sp-engine/sp_harness.py                   # cases 95-99
+    python sp-engine/sp_harness.py all               # all 100
+    python sp-engine/sp_harness.py all --budget 20 --starts 12 --save sp_sols.json
+    python sp-engine/sp_harness.py 95 99 --no-rot    # ablation: rotation off
+    python sp-engine/sp_harness.py 95 99 --aspect 2  # try 2:1 initial shapes
 """
 
 import math

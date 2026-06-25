@@ -6,11 +6,11 @@ of preplaced blocks) into the SP floorplanner, then scores with the official
 evaluator + provided baselines. Isolates PLACEMENT quality from shaping.
 
 Usage (run from iccad2026contest/):
-    python ml-engine/gt_dims_harness.py                 # cases 95-99 (dominant)
-    python ml-engine/gt_dims_harness.py all             # all 100
-    python ml-engine/gt_dims_harness.py 0 1 2
-    python ml-engine/gt_dims_harness.py all --ceiling    # place at GT (upper bound)
-    python ml-engine/gt_dims_harness.py all --budget 3   # 3s/case SA budget
+    python sp-engine/gt_dims_harness.py                 # cases 95-99 (dominant)
+    python sp-engine/gt_dims_harness.py all             # all 100
+    python sp-engine/gt_dims_harness.py 0 1 2
+    python sp-engine/gt_dims_harness.py all --ceiling    # place at GT (upper bound)
+    python sp-engine/gt_dims_harness.py all --budget 3   # 3s/case SA budget
 """
 
 import math
@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))                 # ml-engine modules
+sys.path.insert(0, str(HERE))                 # sp-engine modules
 sys.path.insert(0, str(HERE.parent))          # iccad2026contest
 sys.path.insert(0, str(HERE.parent.parent))   # FloorSet root (loaders)
 
@@ -108,7 +108,7 @@ def run(case_ids, ceiling=False, budget=2.0, macros=False, starts=8, save=None):
     if save:
         import json
         with open(save, 'w') as f:
-            json.dump({'submission': 'ml-engine-gtdims', 'timestamp': '',
+            json.dump({'submission': 'sp-engine-gtdims', 'timestamp': '',
                        'solutions': saved}, f)
         print(f"Saved {len(saved)} solutions to {save}  "
               f"(re-score: python iccad2026_evaluate.py --score {save})")
