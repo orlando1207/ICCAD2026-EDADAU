@@ -1,7 +1,7 @@
 """
 ICCAD 2026 FloorSet Challenge — My Optimizer entry point.
 Uses SP+SA (Sequence-Pair + Simulated Annealing) for placement.
-Falls back to analytic_legalizer if SP+SA is unavailable.
+Falls back to analytic_legalizer_v2 if SP+SA is unavailable.
 """
 import sys
 import os
@@ -19,7 +19,7 @@ except Exception:
     _SP_AVAILABLE = False
 
 if not _SP_AVAILABLE:
-    from analytic_legalizer import MyOptimizer
+    from analytic_legalizer_v2 import MyOptimizer
 else:
     class MyOptimizer:
         """SP+SA floorplanner with size-adaptive time budget."""
