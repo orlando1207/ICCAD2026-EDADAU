@@ -35,7 +35,7 @@ def rank_cost(xywh, case):
 
 
 @torch.no_grad()
-def predict_case(diffusion, case, n_seeds, steps, device, seed0=0):
+def predict_case(diffusion, case, n_seeds, steps, device, seed0=0, topk=1):
     tensors, meta = featurize(case)
     b = {k: v.unsqueeze(0).expand(n_seeds, *v.shape).contiguous().to(device)
          for k, v in tensors.items() if k != 'z0'}
@@ -47,8 +47,10 @@ def predict_case(diffusion, case, n_seeds, steps, device, seed0=0):
     a = torch.tensor([c[1] for c in costs])
     o = torch.tensor([c[2] for c in costs])
     score = h / h.min().clamp(min=1e-8) + a / a.min().clamp(min=1e-8) + 5.0 * o
-    best = int(score.argmin())
-    return cands[best], best, score.tolist()
+    order = score.argsort().tolist()
+    best = order[0]
+    top = [cands[k] for k in order[:max(1, topk)]]
+    return cands[best], best, score.tolist(), top
 
 
 def main():
@@ -61,6 +63,8 @@ def main():
     ap.add_argument('--out', type=str, default='floordiff/out/preds.json')
     ap.add_argument('--device', type=str, default='cuda:0')
     ap.add_argument('--no-ema', action='store_true')
+    ap.add_argument('--save-topk', type=int, default=1,
+                    help='store the K best seeds per case (for best-of-k legalization)')
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -72,12 +76,15 @@ def main():
     for n in ns:
         case = load_validation_case(n)
         t0 = time.time()
-        xywh, best, scores = predict_case(diffusion, case, args.n_seeds,
-                                          args.steps, device)
+        xywh, best, scores, top = predict_case(diffusion, case, args.n_seeds,
+                                               args.steps, device,
+                                               topk=args.save_topk)
         dt = time.time() - t0
-        out['cases'][str(n)] = {'n': n, 'positions': xywh.tolist(),
-                                'best_seed': best, 'seed_scores': scores,
-                                'runtime_s': dt}
+        entry = {'n': n, 'positions': xywh.tolist(), 'best_seed': best,
+                 'seed_scores': scores, 'runtime_s': dt}
+        if args.save_topk > 1:
+            entry['candidates'] = [t.tolist() for t in top]
+        out['cases'][str(n)] = entry
         print(f'case n={n:>3}: {dt:.2f}s  best seed {best}  '
               f'overlap {overlap_ratio(xywh) * 100:.2f}%')
 

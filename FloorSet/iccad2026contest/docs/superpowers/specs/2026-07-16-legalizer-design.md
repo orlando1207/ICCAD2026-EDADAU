@@ -1,8 +1,12 @@
 # FloorDiff Stage-2: Minimal-Perturbation Constraint-Graph Legalizer (MPCG)
 
-Date: 2026-07-16. Design only — no code in this step. Companion to
+Date: 2026-07-16 (design), implemented same day — see §7 for what the
+implementation taught us (several design assumptions needed correction) and the
+measured results. Companion to
 `2026-07-14-diffusion-repo-anatomy-and-contest-model-design.md` (the model) and
 `2026-07-15-floordiff-implementation.md` (stage-1 implementation).
+Code: `floordiff/legalize.py` (+ `floordiff/score_official.py`, extensions to
+`floordiff/sample.py` for top-k seed export).
 
 ## 0. The problem, quantified from the actual predictions
 
@@ -237,6 +241,112 @@ same schema, so `floordiff.evaluate` and `floordiff.visualize` work unchanged).
    best-of-k (k = 1/2/4), ± Stage E reshape.
 5. End state: a single `MyOptimizer.solve()` = featurize → sample (best-of-N) → decode →
    MPCG legalize → verified output; scored end-to-end with `iccad2026_evaluate.py`.
+
+## 7. Implementation notes & measured results (added post-implementation)
+
+The design survived contact with reality, with five corrections that matter:
+
+1. **Separation margin ε must be 0.** GT layouts are 96–97% packed, so separation
+   chains between preplaced anchors have *zero slack*; any ε > 0 makes the true
+   arrangement infeasible and forces restructuring. Touching is legal (official
+   overlap counts only penetration > 1e-6 on both axes), so ε = 0 is safe.
+2. **Axis conflicts are often real dimension misfits, not order errors.** Predicted
+   soft-block dims carry ~13% shape error; chains between preplaced anchors
+   genuinely don't fit their spans. The fix is Stage E arriving early:
+   **reshape-before-flip** in the repair loop — shrink the chain axis of the
+   path's soft non-MIB blocks (area exact, aspect ≤ 3.6), and only flip edges
+   (min-resulting-chain criterion, not min-local-depth) for the remainder. This
+   took the worst-case area gap from +31% to +6–16%.
+3. **All-or-nothing attachment modes lose.** Hard boundary attachment is sometimes
+   feasible yet ruinous (corner blocks dragged across the layout, +20% area). The
+   fix is the DAC'25-style upgrade the design listed as future work: per-attachment/
+   per-contact **binary selection MILP** (`scipy.optimize.milp`, big-M indicators,
+   reward = the constraint's violation saving in official-cost units). The mode
+   ladder remains as fallback and both candidate sets compete.
+4. **The selector must be the official evaluator itself** (legitimate at test
+   time — needs only provided baselines and fixed/preplaced targets). Every
+   hand-rolled proxy disagreed with official semantics somewhere (grouping via
+   shapely union, boundary eps 1e-6) and mis-picked modes/passes/seeds.
+5. **float64 end-to-end**: float32 rounding (~1e-5 at coordinate ~200) exceeds the
+   official 1e-6 overlap tolerance and silently re-creates overlaps.
+
+Also implemented as designed: iterated passes (graph re-derived from the previous
+legal solution, anchor always the original prediction), best-of-k prediction seeds
+(`sample.py --save-topk`, `legalize_best_of`), exact snapping guarded by tolerance,
+LP-weight calibration to official-cost units, `good_enough` early-exit gates.
+
+**Results** (19-case partial validation set, exp-weighted `e^{n/12}`, official
+evaluator, runtime factor neutral):
+
+| Pipeline stage | Total score | Legalize runtime (19 cases) |
+|---|---|---|
+| Raw predictions (any overlap ⇒ 10) | ~10 | — |
+| First feasible legalizer version | 1.392 | — |
+| + eps=0 + reshape + chain-aware flips | 1.299 | — |
+| + MILP selection + official selector + best-of-4 seeds | 1.1145 | 990 s |
+| + speed pass (see below), corner coupling | 1.1144 | **284 s** |
+| + bbox-reshape post-pass, seed gate 1.05 | **1.1109** | 463 s |
+| Ground-truth reference on the same protocol | ~1.15 (GT has boundary violations) | — |
+
+**Speed pass** (990 s → 284–463 s total, max/case 264 s → ~47 s):
+- Official-*parity* in-loop cost (`_violations_official`: boundary eps 1e-6,
+  shapely-union grouping, MIB round-4) vectorized — matches `evaluate_solution`
+  to 2e-15 at ~30× less time than calling it (its HPWL is a Python loop), and
+  avoids a lazy 2.4 s import chain (matplotlib via litetestLoader).
+- **Linearized pin objective**: p2b HPWL enters the LP as a per-block linear
+  coefficient `Σw·sign(c_pred − pin)` instead of one aux var + 2 rows per pin
+  edge (exact while moves stay on the same side of each pin — they're
+  sliver-scale). Removes up to 3.5k vars / 7k rows at n=120.
+- b2b HPWL aux edges pruned to 95% of weight mass (cap 3000); vectorized sparse
+  assembly; MILP only on pass 1 (2 s limit) with the ladder reduced to hard/hard
+  when the MILP succeeds; `good_enough`/`seed_stop` early-exit gates
+  (pass/rung gate 1.10, seed gate 1.05 — a looser seed gate measurably loses
+  score by stopping before a better seed).
+
+**Quality additions**: corner-benefit coupling (a corner block's y-side
+attachment earns the full violation saving only if its x-side was just
+satisfied) and a **bbox-reshape post-pass** (when the area gap is stuck > 4%,
+shrink the soft blocks on the critical extent chain toward the predicted
+extent — area exact — and re-solve once; improved 7 of 19 cases).
+
+100/100 feasibility on every configuration tested. Several cases beat ground
+truth outright (105: 1.072, 117: 1.040, 119: 1.073 — zero or near-zero
+violations with small gaps). Remaining weak cases (100, 110, 80: cost 1.29–1.36)
+are *systematically* hard: doubling to 8 seeds barely moved them (1.31 → 1.30
+aggregate), so the residual is not seed variance. Their signature is a stubborn
+area gap (+5–17%) plus 4–5 boundary violations — likely dense preplaced/boundary
+interaction where the prediction's local order is wrong in a way single-edge
+repair can't see. Next levers, in order of expected value: (a) fine-tune the
+model / more sampling steps on such cases, (b) a targeted second reshape pass
+against the *bbox* (not just anchor spans), (c) grouping-aware attachment (the
+Vb=5 cases leave attachments unselected because the MILP's benefit constant
+underrates corner blocks).
+
+**Official-evaluator integration** — `floordiff_optimizer.py` is a drop-in
+`FloorplanOptimizer` (model loads in `__init__`, outside the timed window;
+solve = featurize → batched sampling → decode top-k → best-of-k MPCG; baselines
+unavailable at solve time are replaced by prediction-derived pseudo-baselines,
+which only set scales/ranking):
+
+```bash
+PY=~/miniconda3/envs/iccad/bin/python
+$PY iccad2026_evaluate.py --validate floordiff_optimizer.py
+$PY iccad2026_evaluate.py --evaluate floordiff_optimizer.py            # all 100
+$PY iccad2026_evaluate.py --evaluate floordiff_optimizer.py --test-id 99
+# knobs: FLOORDIFF_CKPT / FLOORDIFF_DEVICE / FLOORDIFF_SEEDS / FLOORDIFF_TOPK / FLOORDIFF_STEPS
+```
+
+Verified end-to-end: `--validate` PASSED; `--test-id 99` (n=120) → cost 1.1039,
+feasible, 17.4 s; test-ids 79/89 reproduce the offline pipeline exactly.
+
+The three-step JSON pipeline remains for experiments:
+```bash
+$PY -m floordiff.sample --ckpt floordiff/checkpoints/myrun/last.pt \
+    --n-seeds 16 --steps 50 --save-topk 4 --out floordiff/out/preds_top4.json
+$PY -m floordiff.legalize --pred floordiff/out/preds_top4.json \
+    --out floordiff/out/legalized.json
+$PY -m floordiff.score_official --pred floordiff/out/legalized.json
+```
 
 ## Sources
 

@@ -134,19 +134,28 @@ def featurize(case):
     b2b, p2b, pins, gt = case['b2b'], case['p2b'], case['pins'], case['gt']
     n = area.shape[0]
     S = area.sum().sqrt()
-    ox = (pins[:, 0].min() + pins[:, 0].max()) / 2
-    oy = (pins[:, 1].min() + pins[:, 1].max()) / 2
+    if len(pins):
+        ox = (pins[:, 0].min() + pins[:, 0].max()) / 2
+        oy = (pins[:, 1].min() + pins[:, 1].max()) / 2
+    else:
+        ox = oy = torch.tensor(0.0)
 
     fixed = cons[:, 0] > 0
     pre = cons[:, 1] > 0
     frozen_shape = fixed | pre
 
-    # --- known values (inputs by contest definition; from gt here, target_positions at test)
+    # --- known values (inputs by contest definition: from gt at train/validation
+    # time, from case['target'] (the evaluator's target_positions, rows (x,y,w,h))
+    # at solve time)
     wh_known = torch.zeros(n, 2)
     xy_known = torch.zeros(n, 2)     # lower-left, raw frame
     if gt is not None:
         wh_known[frozen_shape] = gt[frozen_shape][:, 0:2]
         xy_known[pre] = gt[pre][:, 2:4]
+    elif case.get('target') is not None:
+        tgt = case['target'].float()
+        wh_known[frozen_shape] = tgt[frozen_shape][:, 2:4]
+        xy_known[pre] = tgt[pre][:, 0:2]
     s_known = torch.zeros(n)
     s_known[frozen_shape] = 0.5 * torch.log(wh_known[frozen_shape, 0] /
                                             wh_known[frozen_shape, 1])
@@ -244,8 +253,11 @@ def featurize(case):
     for g in clu_g:
         pair[g[:, None], g[None, :], 2] = 1.0
 
-    tw = pins[:, 0].max() - pins[:, 0].min()
-    th = pins[:, 1].max() - pins[:, 1].min()
+    if len(pins):
+        tw = pins[:, 0].max() - pins[:, 0].min()
+        th = pins[:, 1].max() - pins[:, 1].min()
+    else:
+        tw = th = torch.tensor(0.0)
     gfeat = torch.tensor([
         n / 120.0,
         pins.shape[0] / 400.0,
@@ -300,6 +312,14 @@ def gt_xywh(case):
     """Ground truth as (x, y, w, h) rows (matching decode()'s output order)."""
     g = case['gt']
     return torch.stack([g[:, 2], g[:, 3], g[:, 0], g[:, 1]], dim=1)
+
+
+def target_xywh(case):
+    """(x, y, w, h) rows valid for fixed/preplaced blocks: from GT when available
+    (train/validation), else from case['target'] (evaluator's target_positions)."""
+    if case['gt'] is not None:
+        return gt_xywh(case)
+    return case['target'].double()
 
 
 # --------------------------------------------------------------------------- training set

@@ -221,7 +221,7 @@ def main():
         if args.gt_check:
             xywh = gt_xywh(case)
         else:
-            xywh = torch.tensor(preds[str(n)]['positions'], dtype=torch.float32)
+            xywh = torch.tensor(preds[str(n)]['positions'], dtype=torch.float64)
         rows.append(evaluate_case(xywh, case))
     print_report(rows, aggregate(rows))
 
