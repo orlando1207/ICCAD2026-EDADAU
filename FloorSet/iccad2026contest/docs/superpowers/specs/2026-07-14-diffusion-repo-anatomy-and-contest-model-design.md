@@ -1,12 +1,9 @@
 # Diffusion Model for FloorSet: Repo Anatomy & Contest Variation Design
 
-Date: 2026-07-14, design part (Part C) revised 2026-07-15. Supersedes
-`2026-07-13-diffusion-floorplan-model-design.md`. **This stage's only goal is making the model's
-raw prediction as close as possible to the ground truth** — which, because every GT layout is
-feasible, simultaneously drives the prediction toward constraint satisfaction for free
-(imitation-first principle, §C.0). All constraint *enforcement* machinery is deferred to the
-future legalization stage; the model keeps only *conditioning*. No code is modified in this
-stage.
+Date: 2026-07-14. Supersedes `2026-07-13-diffusion-floorplan-model-design.md` (this version adds
+the full anatomy of `diff-model/` and drops everything legalizer-related — **this stage's only
+goal is making the model's raw prediction as close as possible to the ground truth**). No code is
+modified in this stage.
 
 ---
 
@@ -16,10 +13,10 @@ stage.
 
 Official code of **MacroDiff** (Yoon, Jeon, Kang — "A Geometric Diffusion Model for Macro
 Placement Generation", DAC'25 Late-Breaking Result). Targets ISPD2005 macro placement:
-fixed-dimension macros + zero-size IO pads on a **fixed canvas**.
+f macros + zero-size IO pads on a **fixed canvas**.
 
 ⚠ The PDF inside the folder (`2605.16451v2.pdf`) is **MacroDiff+** (arXiv, May 2026) — the
-authors' newer system with a different architecture (dual-branch HeteroGNN + Transformer U-Net,
+authors' nixed-dimensionewer system with a different architecture (dual-branch HeteroGNN + Transformer U-Net,
 coordinate diffusion, physics-guided sampling). **The code does not implement that paper.** The
 code implements the older net-HPWL-diffusion LBR. Treat the PDF as the roadmap, the code as a
 parts bin.
@@ -151,40 +148,6 @@ Goal of this stage: **generate `(x, y, w, h)` for all blocks as close as possibl
 truth**. GT is effectively unique per case (the terminal frame pins down translation/rotation),
 so GT-closeness is a well-posed target. No legalizer; no downstream repair assumed.
 
-## C.0 Design philosophy: imitation-first, enforcement deferred
-
-The single organizing principle: **every ground-truth layout already satisfies every constraint**
-(zero overlap, exact areas, boundary/grouping/MIB all met — verified on the data). Therefore a
-model that gets close to GT is *automatically* close to violation-free. We do not need any
-machinery that actively pushes samples toward constraint satisfaction — that is the future
-legalization stage's job, and exact satisfaction (abutment, zero-overlap) is measure-zero for a
-continuous model anyway. What the model needs instead is **input features that tell it which
-constraint role each block plays** (§C.3), so it can imitate the corresponding GT patterns.
-
-The one distinction that matters — and where "defer everything" would over-reach — is
-**enforcement vs. conditioning**:
-
-- *Enforcement* = pushing the sample toward feasibility (physics-guided sampling, auxiliary
-  overlap/boundary/grouping losses, clean-space polish). GT imitation makes these redundant for
-  closeness; **all deferred** (kept only as optional add-ons, §C.9).
-- *Conditioning* = using values that are **given in the input**. Preplaced `(x, y, w, h)` and
-  fixed-shape `(w, h)` are inputs, not predictions to be made; making the model regress them
-  wastes capacity and injects error that corrupts the neighbors GT placed relative to their
-  *true* values. Freezing/inpainting them is the same move as image inpainting not regenerating
-  known pixels — it strictly *improves* GT-closeness. **Kept.**
-- Likewise the `s = ½log(w/h)` output parameterization is *representation*, not enforcement: GT
-  always has `w·h = a` exactly, so width/height carry one real degree of freedom; predicting
-  `(w, h)` independently adds a spurious dimension the data doesn't have and makes the
-  regression harder. **Kept.**
-
-| Mechanism | Verdict |
-|---|---|
-| Physics-guided sampling, aux physics losses, overlap polish | **Deferred** (§C.9) — enforcement |
-| Boundary / grouping handling beyond input features | **Deferred** — imitation covers it |
-| MIB `s`-tying | Optional ablation — cheap either way; feature-only + post-snap is the default |
-| Preplaced/fixed freezing + inpainting | **Kept** — conditioning on known inputs |
-| Area-exact `s` parameterization | **Kept** — output representation matching the data manifold |
-
 ## C.1 Diffusion variable: `z_i = (cx_i, cy_i, s_i)` per block
 
 - `(cx, cy)` = block **center**; `s = ½·log(w/h)`; decode `w = √a·e^s`, `h = √a·e^{−s}`.
@@ -193,21 +156,17 @@ The one distinction that matters — and where "defer everything" would over-rea
 - 3 channels, all near-unit scale (scale `s` by ~2). No rotation variable — spec v10 forbids
   w/h swap for fixed/preplaced blocks, and for soft blocks rotation is absorbed by `s`.
 
-### Constraint handling: conditioning where values are known, features everywhere else
+### Constraints handled by construction, not by learning
 
-| Constraint | Mechanism | Rationale (per §C.0) |
+| Constraint | Mechanism | Effect |
 |---|---|---|
-| Preplaced (hard) | freeze all 3 channels at input values; **inpaint** during sampling (re-impose `q_sample(z_known, t)` after every step); mask out of the loss | conditioning on given inputs — exact for free, and neighbors denoise against the *true* positions GT placed them relative to |
-| Fixed-shape (hard) | freeze `s` at `½log(w_in/h_in)`; diffuse `(cx, cy)` | same — dims are inputs, not predictions |
-| MIB (soft) | **default: input features only** (in-group flag + pairwise `same_mib` attention bias); imitation yields near-identical dims, a trivial post-snap (average `(w,h)` within group) equalizes them exactly. `s`-tying kept as an ablation arm | low stakes either way; feature-only keeps the model simplest |
-| Boundary / grouping (soft) | **input features only**: boundary one-hot, cluster flags + pairwise `same_cluster` bias — learned by imitating GT | GT satisfies them, so closeness ⇒ near-satisfaction; exact satisfaction is the legalization stage's job |
+| Preplaced (hard) | freeze all 3 channels at input values; **inpaint** during sampling (re-impose `q_sample(z_known, t)` after every step); mask out of the loss | exact by construction; acts as fixed spatial context, like MacroDiff's IO pads |
+| Fixed-shape (hard) | freeze `s` only; diffuse `(cx, cy)` | dims exact by construction |
+| MIB (soft) | **tie `s` across the group** (one shared latent / average predictions each step); groups have equal areas (verified) so tied `s` ⇒ identical `(w,h)` | `V_mib ≡ 0` by construction; if the group contains a fixed block, inherit its frozen `s` |
+| Boundary / grouping (soft) | features + attention bias + auxiliary losses (below) — learned, not constructed | minimized, not guaranteed |
 
-Note that inpainting is a **sampling-time-only** mechanism (RePaint works on models trained
-without it), so the conditioning-vs-prediction question for preplaced/fixed blocks can be settled
-empirically with one trained model, evaluated both ways (§C.8, P2).
-
-After this, the model's entire learning burden is: **where blocks go and what aspect they take**
-— i.e., exactly reproducing GT, with constraint roles visible in the input.
+After this, the model's entire learning burden is: **where blocks go, what aspect they take,
+staying overlap-free, honoring boundary/grouping tendencies** — i.e., exactly reproducing GT.
 
 ### Normalization (no canvas exists)
 
@@ -244,7 +203,7 @@ anyway (the structure is in the *weights*, not the topology).
 Design choices and why:
 
 - **x̂0- (or v-) prediction**, not ε: for low-dimensional structured outputs it converges faster,
-  and it keeps the door open for the deferred geometry-aware add-ons (§C.9) without retraining.
+  and it lets auxiliary geometric losses and inference guidance act on decoded geometry directly.
   Use **min-SNR-γ** loss weighting.
 - **AdaLN-Zero** time conditioning (DiT recipe) instead of MacroDiff's "add t to every layer
   input" — better-conditioned, standard.
@@ -260,7 +219,8 @@ Design choices and why:
   pattern, fused by residual addition every k layers) — an *ablation*, not a commitment.
   MacroDiff+'s dual branch exists because hypernets are awkward for Transformers; our 2-pin nets
   fit attention natively, and its gradient-projector fusion `(∇x HPWL)ᵀ·ε_net` reduces, for
-  2-pin nets, to weighted pairwise attraction — which the attention bias already expresses.
+  2-pin nets, to weighted pairwise attraction — which the attention bias + aux HPWL loss already
+  express.
 - Size: 8–12 layers, d_model 256–384, 8 heads ⇒ ~10–25M params. Small on purpose: 1M samples,
   and inference must stay fast (runtime is scored).
 
@@ -295,11 +255,14 @@ repo's edge feature — don't exist in Lite; this is the slot they vacate.)
   Bucket-batch by `n` (pad + mask). The 100 validation cases are held out strictly for eval.
 - **Case sampling**: oversample large `n` softly (∝ `e^{n/24}`) — mirrors the contest weighting
   without starving small cases.
-- **Loss = masked MSE on `x0` (excluding frozen channels), min-SNR-γ weighted — and nothing
-  else.** This *is* the "close to ground truth" objective; per §C.0, no physics/constraint terms
-  in the critical path. (Auxiliary geometry losses — weighted-HPWL match, smooth overlap,
-  boundary distance, cluster cohesion — are catalogued in §C.9 as a deferred ablation, to be
-  tried only if the closeness metrics plateau with systematic geometric error.)
+- **Primary loss**: masked MSE on `x0` (excluding frozen channels), min-SNR-γ weighted. This *is*
+  the "close to ground truth" objective.
+- **Auxiliary geometry losses** on decoded x̂0, weighted toward low-noise timesteps (meaningless
+  at high `t`): weighted-HPWL match to GT; smooth pairwise-overlap penalty; boundary-distance
+  penalty (distance of required block side to the soft bbox side, smooth min/max over blocks);
+  cluster-cohesion (pairwise center gaps beyond abutment distance). All four kernels can be
+  adapted from `utils/score.py` + net weights. These teach the *physics* behind GT rather than
+  just its coordinates, and empirically (MacroDiff+ ablations) beat guidance-only physics.
 - **Augmentation**: dihedral symmetries applied consistently to blocks + terminals + metadata —
   boundary bitmasks remap under flips (x-flip: L↔R), `s → −s` under 90° rotations. Because
   fixed/preplaced dims may not swap, use only the 4 orientation-preserving symmetries (id,
@@ -310,28 +273,31 @@ repo's edge feature — don't exist in Lite; this is the slot they vacate.)
 
 ## C.5 Inference pipeline
 
-Deliberately minimal — a plain conditional sampler plus conditioning and bookkeeping; no
-guidance, no polish (those live in §C.9 if ever needed):
-
 ```
 inputs ─► featurize (frame = terminal bbox center, scale = S)
-       ─► freeze preplaced (cx,cy,s) & fixed-shape (s)
+       ─► freeze preplaced (cx,cy,s) & fixed (s); tie MIB s
        ─► sample N seeds AS ONE BATCH (tiny graphs → one forward pass)
             DDIM / DPM-Solver++, 30–50 steps
             each step:
-              x̂0 ← model prediction  →  standard sampler update
-              re-impose inpainted channels (preplaced / fixed s) via q_sample
-       ─► decode: (w,h) = √a·(e^s, e^{−s})  → soft-block areas exact by construction
-       ─► snap: preplaced/fixed exact from input; MIB post-snap (average (w,h) in group)
-       ─► rank the N samples (GT unavailable at test time → rank by evaluator-cost proxy:
-          weighted HPWL + bbox area + overlap); keep the best
+              x̂0 ← model prediction
+              physics-guided correction (MacroDiff+ Alg. 1):
+                 K ≈ 5–10 grad steps on
+                 L = w₁·weightedHPWL + w₂·overlap + w₃·boundary + w₄·clusterGap + w₅·bboxArea
+                 (two-phase schedule: quality first → feasibility late)
+              re-derive ε_guided, take the DDIM step
+              re-impose inpainted channels (preplaced) via q_sample
+       ─► short clean-space polish (≤100–300 Adam steps, overlap-weight ramp)
+       ─► snap: rescale (w,h) by √(a/(w·h)) → area exact; MIB already tied; preplaced exact
+       ─► rank the N samples by evaluator-cost proxy; keep the best
        ─► emit (x, y, w, h)
 ```
 
-- Best-of-N is *selection*, not enforcement — it needs no gradients and no extra model passes
-  beyond the batched sampling, and it directly buys closeness (diffusion is stochastic; some
-  seeds land nearer GT).
-- Runtime: n≤120, 30–50 steps × N∈[8,32] batched ⇒ well under a second per case on GPU, and
+- **All guidance terms are differentiable through `s`** (`(w,h) = √a·(e^s, e^{−s})`), so guidance
+  *reshapes* blocks, not just moves them — that is how soft-block flexibility is actually
+  exploited (flatten a block to slip beside a fixed one).
+- The polish step is the vestige of MacroDiff's recovery loop, but ~30–50× cheaper because the
+  sampler already outputs a placement rather than a distance prescription.
+- Runtime: n≤120, 50 steps × K grad steps × N∈[8,32] batched ⇒ seconds per case on GPU, still
   CPU-viable at reduced N/steps if the judging environment demands it.
 
 ## C.6 Evaluation protocol (GT-closeness, no legalizer)
@@ -344,33 +310,23 @@ contest-weighted (`e^{n/12}`):
 2. Shape error `|ŝ − s_GT|` (equivalently relative dim error) on soft blocks.
 3. Fraction of blocks within δ of their GT position (δ = 1%, 2%, 5% of S).
 
-**Quality/feasibility of the raw prediction (secondary — the "closeness ⇒ near-feasibility"
-check)**
+**Quality/feasibility of the raw prediction (secondary, sanity)**
 4. Overlap ratio: Σ pairwise overlap / Σ block area.
 5. Weighted-HPWL gap and bbox-area gap vs. baseline (`metrics[6]+metrics[7]`, `metrics[0]`),
    computed with the official `calculate_hpwl_*` / bbox code from `iccad2026_evaluate.py`.
-6. Soft-violation counts via the official evaluator (MIB after post-snap must read 0; boundary
-   and grouping measured raw and with a small tolerance band, since exact contact is
-   measure-zero).
-7. **Diagnostic**: violations plotted *against* displacement per case. If the imitation-first
-   premise holds, they fall together; a case with low displacement but high violations flags a
-   systematic geometric failure worth a §C.9 add-on.
+6. Soft-violation counts via the official evaluator (MIB must read 0 — anything else is a bug in
+   the tying logic).
 
-Ablation ladder: backbone alone → + constraint-type features → + inpainting on/off
-(sampling-time, same trained model) → + `s` vs. `(w,h)` output head → + MIB `s`-tying on/off →
-best-of-N sweep → ± GNN branch → ± terminal tokens.
+Ablation ladder: backbone alone → + constraint freezing/tying → + aux physics losses → +
+physics-guided sampling → + polish + best-of-N → ± GNN branch → ± terminal tokens.
 
 ## C.7 Risks / open questions
 
-- **Imitation ceiling**: a model can be close to GT on average yet leave residual violations
-  (overlap slivers, near-miss boundary contact) — that residual is *by design* the legalization
-  stage's input. What must be monitored now is that violations shrink proportionally with
-  displacement (§C.6 diagnostic 7); if they don't, imitation alone has a systematic geometric
-  blind spot and a §C.9 add-on gets promoted.
 - **Grouping abutment** is measure-zero for a continuous model — expect near-contact, not exact
-  contact. Acceptable at this stage; it barely affects GT-closeness metrics.
+  contact. At this stage that's acceptable (it barely affects GT-closeness metrics); revisit when
+  feasibility becomes the target.
 - **Whitespace mismatch**: GT is 96–97% packed; diffusion output will be a few % looser. Track
-  bbox-area gap; if systematic, this is the first candidate for a §C.9 add-on.
+  bbox-area gap; if systematic, strengthen the bbox aux term.
 - **Frame assumption** (terminal ring ⇒ absolute anchor) verified on 4 validation cases; verify
   on ~1k training-shard samples before locking normalization. Fallback: pin-bbox-centered frame.
 - **Multimodality**: if training shards contain near-ties (multiple optimal layouts), pure
@@ -384,26 +340,8 @@ best-of-N sweep → ± GNN branch → ± terminal tokens.
 | Phase | Deliverable | Exit criterion |
 |---|---|---|
 | P0 | Data pipeline (shards → normalized samples) + eval harness (§C.6) | harness reproduces official evaluator numbers on GT exactly |
-| P1 | Backbone diffusion on `(cx,cy,s)` with full constraint-type features (§C.3), plain sampler | displacement and HPWL gap clearly beat a "pin-pull + greedy pack" trivial baseline |
-| P2 | Conditioning ablations on the same trained model: inpainting on/off (sampling-time), `s` vs. `(w,h)` head (needs retrain), MIB tying on/off | inpainting + `s` confirmed (or refuted) on displacement metrics; preplaced/fixed exact |
-| P3 | Best-of-N + sampler-efficiency sweep (steps ↓, solver choice) | best contest-weighted closeness at acceptable runtime |
-| P4 | Architecture ablations (GNN branch, terminal tokens, size) | final architecture locked |
-| P5 | *Contingent*: promote a §C.9 add-on only if the §C.6 diagnostic exposes a systematic gap | closeness/feasibility gap closed |
-
-## C.9 Deferred enforcement machinery (out of the critical path)
-
-Catalogued so nothing is lost; none of it is needed to pursue GT-closeness, and all of it can be
-added **without retraining** (items 1–2) or with a cheap fine-tune (item 3):
-
-1. **Physics-guided sampling** (MacroDiff+ Alg. 1): at each denoise step, K gradient steps on
-   `L = w₁·weightedHPWL + w₂·overlap + w₃·boundary + w₄·clusterGap + w₅·bboxArea` applied to x̂0,
-   then re-derive the guided noise. All terms differentiable through `s` (`(w,h) = √a·(e^s,
-   e^{−s})`), so guidance can *reshape* blocks, not just move them.
-2. **Clean-space polish**: ≤100–300 Adam steps on the same `L` with an overlap-weight ramp — the
-   cheap descendant of MacroDiff's 500×10-seed recovery loop.
-3. **Auxiliary geometry losses** at train time (weighted-HPWL match, smooth overlap, boundary
-   distance, cluster cohesion; kernels adaptable from `utils/score.py` + net weights), weighted
-   toward low-noise timesteps.
-
-Promotion rule: an item enters the pipeline only when §C.6 diagnostic 7 shows violations *not*
-tracking displacement — i.e., when imitation demonstrably stops being enough.
+| P1 | Backbone diffusion on `(cx,cy,s)`, no constraints/guidance | displacement and HPWL gap clearly beat a "pin-pull + greedy pack" trivial baseline |
+| P2 | Constraint conditioning: freezing, inpainting, MIB tying, boundary/cluster features + bias | preplaced/fixed exact; MIB = 0; closeness improves on constrained blocks' neighbors |
+| P3 | Aux physics losses | overlap ratio and HPWL gap drop without closeness regressing |
+| P4 | Physics-guided sampling + polish + best-of-N | best contest-weighted proxy; overlap < ~3% |
+| P5 | Ablations (GNN branch, terminal tokens, sampler steps ↓ for runtime) | final architecture locked for the next stage |
