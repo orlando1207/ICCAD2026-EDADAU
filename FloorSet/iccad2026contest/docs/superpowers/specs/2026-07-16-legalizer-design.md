@@ -284,9 +284,25 @@ evaluator, runtime factor neutral):
 | First feasible legalizer version | 1.392 | — |
 | + eps=0 + reshape + chain-aware flips | 1.299 | — |
 | + MILP selection + official selector + best-of-4 seeds | 1.1145 | 990 s |
-| + speed pass (see below), corner coupling | 1.1144 | **284 s** |
-| + bbox-reshape post-pass, seed gate 1.05 | **1.1109** | 463 s |
+| + speed pass (see below), corner coupling | 1.1144 | 284 s |
+| + bbox-reshape post-pass, seed gate 1.05 | 1.1109 | 463 s |
+| + **cheap-first ordering** (2026-07-19) | **1.1109** | **216 s** (max/case 49 s) |
 | Ground-truth reference on the same protocol | ~1.15 (GT has boundary violations) | — |
+
+**Cheap-first ordering** (the final speed redesign): the plain hard/hard LP costs
+~a tenth of the MILP and is already excellent on most cases — it now runs FIRST,
+and when it clears `good_enough` (1.10) the MILP and every other rung are skipped
+entirely. Same best score at 2.1× less time (4.6× vs the first working version).
+Two negative results worth recording: (a) a separate "fast profile + escalation"
+mode (first-feasible rungs, rerun hard cases) was *slower and worse* than simple
+gating — kept behind `--fast` but not default; (b) better raw predictions
+(100 DDIM steps, 32 seeds: displacement 0.0125 vs 0.0152, loose violations 2.0
+vs 2.7) did **not** improve the final score (1.1167 vs 1.1109) — the legalizer
+washes out per-seed quality, and seed *diversity* (top-4) matters more than
+per-seed polish, so sampling stays at 16 seeds × 50 steps. `seed_stop 1.08`
+buys another 22% runtime for +0.004 score if ever needed. NB: all timings above
+were measured on a host at load average ~50–76 (shared machine) — absolute
+numbers are pessimistic, ratios are meaningful.
 
 **Speed pass** (990 s → 284–463 s total, max/case 264 s → ~47 s):
 - Official-*parity* in-loop cost (`_violations_official`: boundary eps 1e-6,

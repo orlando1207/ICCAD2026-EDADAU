@@ -1,20 +1,21 @@
-"""FloorDiff contest optimizer: diffusion prediction + MPCG legalization.
+"""FloorDiff contest optimizer: diffusion prediction + EGL legalization.
 
 Drop-in `FloorplanOptimizer` for the official evaluator:
 
     python iccad2026_evaluate.py --validate floordiff_optimizer.py
     python iccad2026_evaluate.py --evaluate floordiff_optimizer.py [--test-id N]
 
-Pipeline per case (docs/superpowers/specs/2026-07-16-legalizer-design.md):
+Pipeline per case (docs/superpowers/specs/2026-07-20-egl-legalizer-design.md):
   featurize -> batched diffusion sampling (N seeds, DDIM) -> decode top-k
-  -> MPCG legalization per candidate -> best by official-cost selector.
+  -> EGL legalization (ePlace-style gradient cleanup + constraint-graph
+  minimal-movement assignment) per candidate -> best by official-cost proxy.
 
 The model checkpoint loads in __init__ (not counted in the evaluator's per-case
 runtime). Knobs via environment variables:
   FLOORDIFF_CKPT    checkpoint path   (default floordiff/checkpoints/myrun/last.pt)
   FLOORDIFF_DEVICE  torch device      (default cuda if available, else cpu)
-  FLOORDIFF_SEEDS   sampled seeds     (default 16)
-  FLOORDIFF_TOPK    legalized seeds   (default 4)
+  FLOORDIFF_SEEDS   sampled seeds     (default 32)
+  FLOORDIFF_TOPK    legalized seeds   (default 6)
   FLOORDIFF_STEPS   DDIM steps        (default 50)
 """
 
@@ -33,7 +34,7 @@ sys.path.insert(0, str(_HERE))
 
 from iccad2026_evaluate import FloorplanOptimizer          # noqa: E402
 from floordiff.data import featurize, decode               # noqa: E402
-from floordiff.legalize import legalize_best_of            # noqa: E402
+from floordiff.legalizer import legalize_best_of           # noqa: E402
 from floordiff.sample import load_checkpoint, rank_cost    # noqa: E402
 
 
@@ -46,7 +47,7 @@ def _clean(t):
 
 
 class MyOptimizer(FloorplanOptimizer):
-    """Diffusion prediction + minimal-perturbation constraint-graph legalizer."""
+    """Diffusion prediction + EGL (gradient + constraint-graph) legalizer."""
 
     def __init__(self, verbose: bool = False, **kwargs):
         super().__init__()
@@ -57,8 +58,8 @@ class MyOptimizer(FloorplanOptimizer):
             'FLOORDIFF_DEVICE', 'cuda:0' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device(dev)
         self.diffusion = load_checkpoint(ckpt, self.device)
-        self.n_seeds = int(os.environ.get('FLOORDIFF_SEEDS', 16))
-        self.topk = int(os.environ.get('FLOORDIFF_TOPK', 4))
+        self.n_seeds = int(os.environ.get('FLOORDIFF_SEEDS', 32))
+        self.topk = int(os.environ.get('FLOORDIFF_TOPK', 6))
         self.steps = int(os.environ.get('FLOORDIFF_STEPS', 50))
 
     def solve(self, block_count, area_targets, b2b_connectivity,
