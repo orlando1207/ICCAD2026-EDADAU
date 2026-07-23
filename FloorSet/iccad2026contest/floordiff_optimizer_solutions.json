@@ -1,17 +1,10 @@
 {
-  "submission_name": "floordiff_optimizer",
+  "submission": "floordiff_optimizer",
   "timestamp": "2026-07-23T15:12:17.020297",
-  "total_score": 1.1028937701178172,
-  "test_results": [
+  "solutions": [
     {
       "test_id": 0,
       "block_count": 21,
-      "is_feasible": true,
-      "hpwl_gap": -0.010134625842756402,
-      "area_gap": 0.01128022799737672,
-      "violations_relative": 0.043478260869565216,
-      "runtime_seconds": 1.3096370697021484,
-      "cost": 1.0970017645869057,
       "positions": [
         [
           42.33386830612823,
@@ -139,18 +132,11 @@
           17.594070571197648,
           19.150770905520936
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 1,
       "block_count": 22,
-      "is_feasible": true,
-      "hpwl_gap": 0.0023032796616373626,
-      "area_gap": 0.03235384419156529,
-      "violations_relative": 0.07407407407407407,
-      "runtime_seconds": 0.7348225116729736,
-      "cost": 1.1797803567211664,
       "positions": [
         [
           86.79964771045569,
@@ -284,18 +270,11 @@
           18.007921285247907,
           25.259384787794545
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 2,
       "block_count": 23,
-      "is_feasible": true,
-      "hpwl_gap": 0.0026787500774956446,
-      "area_gap": 0.02998513566569394,
-      "violations_relative": 0.07407407407407407,
-      "runtime_seconds": 0.7391879558563232,
-      "cost": 1.1786245928625327,
       "positions": [
         [
           35.38331584765734,
@@ -435,18 +414,11 @@
           12.018516383430425,
           4.947365886351524
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 3,
       "block_count": 24,
-      "is_feasible": true,
-      "hpwl_gap": -0.08701693432266104,
-      "area_gap": 0.10576670327300522,
-      "violations_relative": 0.038461538461538464,
-      "runtime_seconds": 0.7284374237060547,
-      "cost": 1.137070850947953,
       "positions": [
         [
           0.0,
@@ -592,18 +564,11 @@
           13.23619699125544,
           13.626421968126268
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 4,
       "block_count": 25,
-      "is_feasible": true,
-      "hpwl_gap": 0.01775417917221585,
-      "area_gap": 0.055261313430064844,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.6314895153045654,
-      "cost": 1.0365077463011403,
       "positions": [
         [
           34.0,
@@ -755,18 +720,11 @@
           9.454061436316556,
           8.805104755074858
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 5,
       "block_count": 26,
-      "is_feasible": true,
-      "hpwl_gap": -0.018641677289763875,
-      "area_gap": 0.02478823536427727,
-      "violations_relative": 0.043478260869565216,
-      "runtime_seconds": 0.7560634613037109,
-      "cost": 1.1043693644425945,
       "positions": [
         [
           63.69956587639206,
@@ -924,18 +882,11 @@
           18.293988281162417,
           18.52641379917899
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 6,
       "block_count": 27,
-      "is_feasible": true,
-      "hpwl_gap": 0.005517012333060891,
-      "area_gap": 0.03167858615994532,
-      "violations_relative": 0.03571428571428571,
-      "runtime_seconds": 0.7519850730895996,
-      "cost": 1.0940162376271845,
       "positions": [
         [
           71.55469388425776,
@@ -1099,18 +1050,11 @@
           7.077720633495182,
           11.761413810884791
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 7,
       "block_count": 28,
-      "is_feasible": true,
-      "hpwl_gap": 0.006942712114274461,
-      "area_gap": 0.021396407259523516,
-      "violations_relative": 0.09090909090909091,
-      "runtime_seconds": 0.816138505935669,
-      "cost": 1.21639101669141,
       "positions": [
         [
           -0.10504495295569072,
@@ -1280,18 +1224,11 @@
           14.770575213837452,
           17.84669874840625
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 8,
       "block_count": 29,
-      "is_feasible": true,
-      "hpwl_gap": 0.006209052851873297,
-      "area_gap": 0.020805759709608015,
-      "violations_relative": 0.03571428571428571,
-      "runtime_seconds": 0.7685446739196777,
-      "cost": 1.0885489446833287,
       "positions": [
         [
           11.934416515100683,
@@ -1467,18 +1404,11 @@
           7.0,
           10.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 9,
       "block_count": 30,
-      "is_feasible": true,
-      "hpwl_gap": 0.023693601443964995,
-      "area_gap": 0.026086120209829495,
-      "violations_relative": 0.07142857142857142,
-      "runtime_seconds": 0.7815265655517578,
-      "cost": 1.1822770670728273,
       "positions": [
         [
           84.32056648010523,
@@ -1660,18 +1590,11 @@
           7.216606023354758,
           8.2393298061255
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 10,
       "block_count": 31,
-      "is_feasible": true,
-      "hpwl_gap": -0.05456241871211278,
-      "area_gap": 0.04183973361185794,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.5344541072845459,
-      "cost": 1.020919866805929,
       "positions": [
         [
           -0.8240593966834844,
@@ -1859,18 +1782,11 @@
           13.250371628918263,
           9.423584494387875
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 11,
       "block_count": 32,
-      "is_feasible": true,
-      "hpwl_gap": -0.017419750749432573,
-      "area_gap": 0.05318485755407852,
-      "violations_relative": 0.03571428571428571,
-      "runtime_seconds": 0.7622780799865723,
-      "cost": 1.102602800966208,
       "positions": [
         [
           52.3310745010324,
@@ -2064,18 +1980,11 @@
           8.240489050408621,
           9.260008461675117
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 12,
       "block_count": 33,
-      "is_feasible": true,
-      "hpwl_gap": -0.033124627244359266,
-      "area_gap": 0.03415642166163308,
-      "violations_relative": 0.09090909090909091,
-      "runtime_seconds": 0.7708830833435059,
-      "cost": 1.2198796415356057,
       "positions": [
         [
           92.0,
@@ -2275,18 +2184,11 @@
           14.092607009536206,
           17.720781497750366
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 13,
       "block_count": 34,
-      "is_feasible": true,
-      "hpwl_gap": -0.012834203114034052,
-      "area_gap": 0.01737974280906902,
-      "violations_relative": 0.034482758620689655,
-      "runtime_seconds": 0.7937643527984619,
-      "cost": 1.0807095855337083,
       "positions": [
         [
           88.44815284644727,
@@ -2492,18 +2394,11 @@
           5.525325706100272,
           6.277457986220228
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 14,
       "block_count": 35,
-      "is_feasible": true,
-      "hpwl_gap": 0.03329004696752122,
-      "area_gap": 0.03640942137575325,
-      "violations_relative": 0.03571428571428571,
-      "runtime_seconds": 0.8061838150024414,
-      "cost": 1.1114714890660835,
       "positions": [
         [
           -0.7118811470907662,
@@ -2715,18 +2610,11 @@
           11.183443073345597,
           10.633576627162684
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 15,
       "block_count": 36,
-      "is_feasible": true,
-      "hpwl_gap": -0.0027922826918911096,
-      "area_gap": 0.021276026780491057,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.5923070907592773,
-      "cost": 1.0106380133902455,
       "positions": [
         [
           26.47584159993236,
@@ -2944,18 +2832,11 @@
           27.4668139139408,
           25.32809281650909
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 16,
       "block_count": 37,
-      "is_feasible": true,
-      "hpwl_gap": -0.00011647831633998907,
-      "area_gap": 0.03469523672062724,
-      "violations_relative": 0.029411764705882353,
-      "runtime_seconds": 0.8254005908966064,
-      "cost": 1.078986738556318,
       "positions": [
         [
           87.17438856756995,
@@ -3179,18 +3060,11 @@
           18.98929583543938,
           18.78742683945075
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 17,
       "block_count": 38,
-      "is_feasible": true,
-      "hpwl_gap": -0.018412422029719332,
-      "area_gap": 0.03195853433706922,
-      "violations_relative": 0.06060606060606061,
-      "runtime_seconds": 0.8002336025238037,
-      "cost": 1.1469027679795996,
       "positions": [
         [
           52.75342708644719,
@@ -3420,18 +3294,11 @@
           29.290741884732792,
           17.762438089856936
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 18,
       "block_count": 39,
-      "is_feasible": true,
-      "hpwl_gap": -0.005097758215355342,
-      "area_gap": 0.03718793575078756,
-      "violations_relative": 0.03333333333333333,
-      "runtime_seconds": 0.7877318859100342,
-      "cost": 1.0888149251402628,
       "positions": [
         [
           24.611125392999732,
@@ -3667,18 +3534,11 @@
           10.0,
           27.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 19,
       "block_count": 40,
-      "is_feasible": true,
-      "hpwl_gap": 0.040258723930275686,
-      "area_gap": 0.030683130356388835,
-      "violations_relative": 0.03125,
-      "runtime_seconds": 0.8197236061096191,
-      "cost": 1.1022530643146156,
       "positions": [
         [
           102.20101646658074,
@@ -3920,18 +3780,11 @@
           22.354060116348887,
           9.974698416800974
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 20,
       "block_count": 41,
-      "is_feasible": true,
-      "hpwl_gap": 0.01735768156357505,
-      "area_gap": 0.0677251592376157,
-      "violations_relative": 0.03125,
-      "runtime_seconds": 0.9014508724212646,
-      "cost": 1.1097795652087883,
       "positions": [
         [
           85.84864714199296,
@@ -4179,18 +4032,11 @@
           21.970027393384072,
           10.149054774690836
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 21,
       "block_count": 42,
-      "is_feasible": true,
-      "hpwl_gap": -0.008190712402803243,
-      "area_gap": 0.06223750022021025,
-      "violations_relative": 0.029411764705882353,
-      "runtime_seconds": 0.8243765830993652,
-      "cost": 1.093592236485222,
       "positions": [
         [
           42.511717193325744,
@@ -4444,18 +4290,11 @@
           12.0,
           16.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 22,
       "block_count": 43,
-      "is_feasible": true,
-      "hpwl_gap": -0.00016395292250062098,
-      "area_gap": 0.03264927880701433,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.7277765274047852,
-      "cost": 1.0163246394035073,
       "positions": [
         [
           28.0,
@@ -4715,18 +4554,11 @@
           9.187548510539193,
           12.943605451689665
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 23,
       "block_count": 44,
-      "is_feasible": true,
-      "hpwl_gap": 0.003452778517244419,
-      "area_gap": 0.032070329605400696,
-      "violations_relative": 0.03125,
-      "runtime_seconds": 1.0001108646392822,
-      "cost": 1.0834015347979071,
       "positions": [
         [
           53.74695533291798,
@@ -4992,18 +4824,11 @@
           17.22347519352461,
           9.781417449715123
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 24,
       "block_count": 45,
-      "is_feasible": true,
-      "hpwl_gap": 0.006905663488529603,
-      "area_gap": 0.01508819142502483,
-      "violations_relative": 0.07142857142857142,
-      "runtime_seconds": 0.838104248046875,
-      "cost": 1.1662506654606466,
       "positions": [
         [
           21.401427619130356,
@@ -5275,18 +5100,11 @@
           11.032922819261072,
           27.66519871071727
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 25,
       "block_count": 46,
-      "is_feasible": true,
-      "hpwl_gap": 0.020309466486404228,
-      "area_gap": 0.023739640909350632,
-      "violations_relative": 0.08823529411764706,
-      "runtime_seconds": 1.0574798583984375,
-      "cost": 1.2192746160096897,
       "positions": [
         [
           83.50151520700042,
@@ -5564,18 +5382,11 @@
           18.817176848902673,
           28.01759263248025
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 26,
       "block_count": 47,
-      "is_feasible": true,
-      "hpwl_gap": -0.0028683277639684505,
-      "area_gap": 0.026784915617472906,
-      "violations_relative": 0.08571428571428572,
-      "runtime_seconds": 0.8846354484558105,
-      "cost": 1.2028961928039357,
       "positions": [
         [
           94.79641006793814,
@@ -5859,18 +5670,11 @@
           29.520993338390827,
           23.498531265846538
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 27,
       "block_count": 48,
-      "is_feasible": true,
-      "hpwl_gap": 0.03986982576494343,
-      "area_gap": 0.04287440340426534,
-      "violations_relative": 0.02564102564102564,
-      "runtime_seconds": 0.8866097927093506,
-      "cost": 1.0961688488356574,
       "positions": [
         [
           44.12752393829971,
@@ -6160,18 +5964,11 @@
           20.727231491179882,
           29.6431282866867
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 28,
       "block_count": 49,
-      "is_feasible": true,
-      "hpwl_gap": -0.016932545914187382,
-      "area_gap": 0.04631207822877306,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.55501389503479,
-      "cost": 1.0231560391143866,
       "positions": [
         [
           60.71409238382328,
@@ -6467,18 +6264,11 @@
           14.401553896734919,
           14.45052445906778
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 29,
       "block_count": 50,
-      "is_feasible": true,
-      "hpwl_gap": 0.003642223329684655,
-      "area_gap": 0.02489387552428776,
-      "violations_relative": 0.02631578947368421,
-      "runtime_seconds": 0.8654558658599854,
-      "cost": 1.0690803551391843,
       "positions": [
         [
           76.74771734762189,
@@ -6780,18 +6570,11 @@
           12.67807149679984,
           26.420264901647222
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 30,
       "block_count": 51,
-      "is_feasible": true,
-      "hpwl_gap": 0.026503412595319593,
-      "area_gap": 0.0626310948244696,
-      "violations_relative": 0.05128205128205128,
-      "runtime_seconds": 0.9996345043182373,
-      "cost": 1.15738921397707,
       "positions": [
         [
           136.0,
@@ -7099,18 +6882,11 @@
           22.66419031162179,
           18.102300478048427
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 31,
       "block_count": 52,
-      "is_feasible": true,
-      "hpwl_gap": 0.0029026003805012576,
-      "area_gap": 0.02179867150246378,
-      "violations_relative": 0.05,
-      "runtime_seconds": 0.993994951248169,
-      "cost": 1.118820481737914,
       "positions": [
         [
           68.80955904694005,
@@ -7424,18 +7200,11 @@
           19.163386175038966,
           31.0279199407536
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 32,
       "block_count": 53,
-      "is_feasible": true,
-      "hpwl_gap": 0.01095682457757863,
-      "area_gap": 0.02373315073900341,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.6459493637084961,
-      "cost": 1.017344987658291,
       "positions": [
         [
           26.29881028542168,
@@ -7755,18 +7524,11 @@
           25.24332230811652,
           22.573296632393333
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 33,
       "block_count": 54,
-      "is_feasible": true,
-      "hpwl_gap": 0.01698061340184672,
-      "area_gap": 0.0784793121889032,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.7927703857421875,
-      "cost": 1.047729962795375,
       "positions": [
         [
           55.08307736210009,
@@ -8092,18 +7854,11 @@
           23.695507192968826,
           8.029876328331714
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 34,
       "block_count": 55,
-      "is_feasible": true,
-      "hpwl_gap": 0.020905980636713648,
-      "area_gap": 0.0700267329944762,
-      "violations_relative": 0.024390243902439025,
-      "runtime_seconds": 0.9772615432739258,
-      "cost": 1.0977290525784889,
       "positions": [
         [
           60.89562342983105,
@@ -8435,18 +8190,11 @@
           24.0,
           19.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 35,
       "block_count": 56,
-      "is_feasible": true,
-      "hpwl_gap": 0.0009062206159044078,
-      "area_gap": 0.07601943652251583,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.7484538555145264,
-      "cost": 1.0384628285692101,
       "positions": [
         [
           0.0,
@@ -8784,18 +8532,11 @@
           12.0,
           27.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 36,
       "block_count": 57,
-      "is_feasible": true,
-      "hpwl_gap": -0.00030418539459875276,
-      "area_gap": 0.025743679256508306,
-      "violations_relative": 0.02564102564102564,
-      "runtime_seconds": 1.0116291046142578,
-      "cost": 1.066168896702443,
       "positions": [
         [
           102.68450407223906,
@@ -9139,18 +8880,11 @@
           26.16086579561543,
           24.546893580727367
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 37,
       "block_count": 58,
-      "is_feasible": true,
-      "hpwl_gap": 0.0060626073220485365,
-      "area_gap": 0.039093357799032905,
-      "violations_relative": 0.024390243902439025,
-      "runtime_seconds": 1.0554001331329346,
-      "cost": 1.073696492159623,
       "positions": [
         [
           31.761871854308733,
@@ -9500,18 +9234,11 @@
           20.564499945383616,
           13.493155619136193
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 38,
       "block_count": 59,
-      "is_feasible": true,
-      "hpwl_gap": 0.005225875837694449,
-      "area_gap": 0.02523153869998406,
-      "violations_relative": 0.045454545454545456,
-      "runtime_seconds": 1.1253695487976074,
-      "cost": 1.1118474546842942,
       "positions": [
         [
           83.3634955497385,
@@ -9867,18 +9594,11 @@
           13.68963895912872,
           10.351843519369023
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 39,
       "block_count": 60,
-      "is_feasible": true,
-      "hpwl_gap": 0.00819391422848458,
-      "area_gap": 0.03843554170258801,
-      "violations_relative": 0.05263157894736842,
-      "runtime_seconds": 1.0960798263549805,
-      "cost": 1.1369056724247661,
       "positions": [
         [
           0.0,
@@ -10240,18 +9960,11 @@
           4.967775508875502,
           3.9897133213682894
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 40,
       "block_count": 61,
-      "is_feasible": true,
-      "hpwl_gap": -0.008508491319504503,
-      "area_gap": 0.023904357831764565,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.9132144451141357,
-      "cost": 1.0119521789158823,
       "positions": [
         [
           97.97827559037333,
@@ -10619,18 +10332,11 @@
           11.0,
           10.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 41,
       "block_count": 62,
-      "is_feasible": true,
-      "hpwl_gap": 0.014683075167943453,
-      "area_gap": 0.03554995350181214,
-      "violations_relative": 0.022222222222222223,
-      "runtime_seconds": 1.0520398616790771,
-      "cost": 1.0717048766314807,
       "positions": [
         [
           117.19125060604833,
@@ -11004,18 +10710,11 @@
           18.964365298297334,
           9.928621543623061
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 42,
       "block_count": 63,
-      "is_feasible": true,
-      "hpwl_gap": -0.02271525677379016,
-      "area_gap": 0.04610546615423769,
-      "violations_relative": 0.027777777777777776,
-      "runtime_seconds": 1.047243595123291,
-      "cost": 1.081497428488611,
       "positions": [
         [
           92.62450727747027,
@@ -11395,18 +11094,11 @@
           24.0,
           15.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 43,
       "block_count": 64,
-      "is_feasible": true,
-      "hpwl_gap": 0.01938482045341791,
-      "area_gap": 0.029545970729071613,
-      "violations_relative": 0.025,
-      "runtime_seconds": 1.1151435375213623,
-      "cost": 1.0769908596225053,
       "positions": [
         [
           58.47492698162184,
@@ -11792,18 +11484,11 @@
           21.951413903416313,
           18.870675466294298
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 44,
       "block_count": 65,
-      "is_feasible": true,
-      "hpwl_gap": 0.006562594112041282,
-      "area_gap": 0.015924713481291233,
-      "violations_relative": 0.021739130434782608,
-      "runtime_seconds": 0.7246503829956055,
-      "cost": 1.0561805801955713,
       "positions": [
         [
           40.13342595174433,
@@ -12195,18 +11880,11 @@
           25.565367732230218,
           25.19619451543451
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 45,
       "block_count": 66,
-      "is_feasible": true,
-      "hpwl_gap": 0.0030846291617064817,
-      "area_gap": 0.027085259585115953,
-      "violations_relative": 0.046511627906976744,
-      "runtime_seconds": 1.2214570045471191,
-      "cost": 1.1140427921672058,
       "positions": [
         [
           -0.4276011262546291,
@@ -12604,18 +12282,11 @@
           8.64812801638118,
           23.376620369598093
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 46,
       "block_count": 67,
-      "is_feasible": true,
-      "hpwl_gap": -0.011280926805551993,
-      "area_gap": 0.018394518819202968,
-      "violations_relative": 0.045454545454545456,
-      "runtime_seconds": 1.338953971862793,
-      "cost": 1.1052419973106595,
       "positions": [
         [
           68.96960871613247,
@@ -13019,18 +12690,11 @@
           18.0,
           26.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 47,
       "block_count": 68,
-      "is_feasible": true,
-      "hpwl_gap": -0.0062054293873172895,
-      "area_gap": 0.0512527812668414,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.8002102375030518,
-      "cost": 1.0256263906334206,
       "positions": [
         [
           52.068728454376,
@@ -13440,18 +13104,11 @@
           10.056292443663574,
           25.621769033124554
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 48,
       "block_count": 69,
-      "is_feasible": true,
-      "hpwl_gap": 0.000768064457748729,
-      "area_gap": 0.03520694305631891,
-      "violations_relative": 0.04,
-      "runtime_seconds": 1.2817809581756592,
-      "cost": 1.102772697874708,
       "positions": [
         [
           18.477783671437813,
@@ -13867,18 +13524,11 @@
           23.131885280196,
           22.27747608854331
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 49,
       "block_count": 70,
-      "is_feasible": true,
-      "hpwl_gap": 0.0032680035505209862,
-      "area_gap": 0.042423217202668714,
-      "violations_relative": 0.041666666666666664,
-      "runtime_seconds": 1.3450407981872559,
-      "cost": 1.111735035953334,
       "positions": [
         [
           -3.5487584618987356,
@@ -14300,18 +13950,11 @@
           8.099753984683693,
           6.851566199373954
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 50,
       "block_count": 71,
-      "is_feasible": true,
-      "hpwl_gap": -0.008450061603072814,
-      "area_gap": 0.03222264352266469,
-      "violations_relative": 0.02127659574468085,
-      "runtime_seconds": 1.1517395973205566,
-      "cost": 1.06028326473493,
       "positions": [
         [
           99.03130049563981,
@@ -14739,18 +14382,11 @@
           16.951298854551563,
           10.289240619673228
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 51,
       "block_count": 72,
-      "is_feasible": true,
-      "hpwl_gap": -0.0054705354950466715,
-      "area_gap": 0.03161956920115228,
-      "violations_relative": 0.058823529411764705,
-      "runtime_seconds": 1.815561294555664,
-      "cost": 1.1426306258181005,
       "positions": [
         [
           78.41228752732728,
@@ -15184,18 +14820,11 @@
           18.002519352409436,
           25.54220302902131
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 52,
       "block_count": 73,
-      "is_feasible": true,
-      "hpwl_gap": 0.005193825053458269,
-      "area_gap": 0.03948901528754291,
-      "violations_relative": 0.021739130434782608,
-      "runtime_seconds": 1.3047654628753662,
-      "cost": 1.0677715012199795,
       "positions": [
         [
           100.79080000467229,
@@ -15635,18 +15264,11 @@
           18.0,
           17.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 53,
       "block_count": 74,
-      "is_feasible": true,
-      "hpwl_gap": 0.005259087830104728,
-      "area_gap": 0.028423573986534004,
-      "violations_relative": 0.022727272727272728,
-      "runtime_seconds": 1.5391907691955566,
-      "cost": 1.06412794584368,
       "positions": [
         [
           97.8552184358536,
@@ -16092,18 +15714,11 @@
           11.136572524270855,
           24.026244091153227
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 54,
       "block_count": 75,
-      "is_feasible": true,
-      "hpwl_gap": 0.0007321435460925294,
-      "area_gap": 0.026384234276380848,
-      "violations_relative": 0.061224489795918366,
-      "runtime_seconds": 1.4338595867156982,
-      "cost": 1.145585750490329,
       "positions": [
         [
           76.57022837700005,
@@ -16555,18 +16170,11 @@
           26.12000098065952,
           9.864471455076792
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 55,
       "block_count": 76,
-      "is_feasible": true,
-      "hpwl_gap": -0.004750519169175654,
-      "area_gap": 0.017189559025150514,
-      "violations_relative": 0.0625,
-      "runtime_seconds": 1.5294153690338135,
-      "cost": 1.1428876141759516,
       "positions": [
         [
           19.828490907691407,
@@ -17024,18 +16632,11 @@
           9.691195677581845,
           19.428975193567567
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 56,
       "block_count": 77,
-      "is_feasible": true,
-      "hpwl_gap": 0.036164816716057334,
-      "area_gap": 0.08446079699643863,
-      "violations_relative": 0.02040816326530612,
-      "runtime_seconds": 1.3892786502838135,
-      "cost": 1.1044862469075754,
       "positions": [
         [
           32.90451499141061,
@@ -17499,18 +17100,11 @@
           24.0,
           23.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 57,
       "block_count": 78,
-      "is_feasible": true,
-      "hpwl_gap": 0.002004423070553801,
-      "area_gap": 0.015843427389645115,
-      "violations_relative": 0.05,
-      "runtime_seconds": 1.8757524490356445,
-      "cost": 1.1150333807150352,
       "positions": [
         [
           73.36691169057673,
@@ -17980,18 +17574,11 @@
           21.0,
           10.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 58,
       "block_count": 79,
-      "is_feasible": true,
-      "hpwl_gap": -0.005000311155315078,
-      "area_gap": 0.0415476924990465,
-      "violations_relative": 0.023809523809523808,
-      "runtime_seconds": 1.3530426025390625,
-      "cost": 1.0705580558752765,
       "positions": [
         [
           118.85763081018669,
@@ -18467,18 +18054,11 @@
           13.642473155025373,
           7.191437965356558
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 59,
       "block_count": 80,
-      "is_feasible": true,
-      "hpwl_gap": 0.01122288861672014,
-      "area_gap": 0.024289133713806595,
-      "violations_relative": 0.061224489795918366,
-      "runtime_seconds": 2.1129791736602783,
-      "cost": 1.150330387167252,
       "positions": [
         [
           106.41524726054429,
@@ -18960,18 +18540,11 @@
           14.692911748837265,
           27.181337428083502
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 60,
       "block_count": 81,
-      "is_feasible": true,
-      "hpwl_gap": 0.018949988442909012,
-      "area_gap": 0.046135475240550436,
-      "violations_relative": 0.022727272727272728,
-      "runtime_seconds": 1.4986419677734375,
-      "cost": 1.080559515857866,
       "positions": [
         [
           14.52143814197735,
@@ -19459,18 +19032,11 @@
           24.297627315682124,
           18.272072066891674
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 61,
       "block_count": 82,
-      "is_feasible": true,
-      "hpwl_gap": -0.01121604393517692,
-      "area_gap": 0.060464474247705305,
-      "violations_relative": 0.043478260869565216,
-      "runtime_seconds": 1.5842883586883545,
-      "cost": 1.123828063665185,
       "positions": [
         [
           27.139543481092247,
@@ -19964,18 +19530,11 @@
           13.957369763331064,
           11.076298726019749
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 62,
       "block_count": 83,
-      "is_feasible": true,
-      "hpwl_gap": 0.014138093070822524,
-      "area_gap": 0.02134436214434274,
-      "violations_relative": 0.0,
-      "runtime_seconds": 0.9310283660888672,
-      "cost": 1.0177412276075826,
       "positions": [
         [
           27.53290247690948,
@@ -20475,18 +20034,11 @@
           23.46709752309052,
           22.339320149872595
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 63,
       "block_count": 84,
-      "is_feasible": true,
-      "hpwl_gap": 0.0036942051304828414,
-      "area_gap": 0.024768561154091574,
-      "violations_relative": 0.0425531914893617,
-      "runtime_seconds": 1.5674211978912354,
-      "cost": 1.1043284919137817,
       "positions": [
         [
           94.35086661158357,
@@ -20992,18 +20544,11 @@
           15.120220775702666,
           10.093371001465583
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 64,
       "block_count": 85,
-      "is_feasible": true,
-      "hpwl_gap": 0.003898284327184969,
-      "area_gap": 0.026691878630934633,
-      "violations_relative": 0.08928571428571429,
-      "runtime_seconds": 1.6992084980010986,
-      "cost": 1.2137936701266065,
       "positions": [
         [
           0.0,
@@ -21515,18 +21060,11 @@
           17.033682656094296,
           5.75970595842068
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 65,
       "block_count": 86,
-      "is_feasible": true,
-      "hpwl_gap": -0.0025222039538687754,
-      "area_gap": 0.023554128276090637,
-      "violations_relative": 0.018518518518518517,
-      "runtime_seconds": 1.6165380477905273,
-      "cost": 1.0499528845239179,
       "positions": [
         [
           78.91550922112054,
@@ -22044,18 +21582,11 @@
           11.0,
           21.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 66,
       "block_count": 87,
-      "is_feasible": true,
-      "hpwl_gap": 0.007138600516043864,
-      "area_gap": 0.03244437554898707,
-      "violations_relative": 0.02,
-      "runtime_seconds": 1.5089993476867676,
-      "cost": 1.06140996817393,
       "positions": [
         [
           0.0,
@@ -22579,18 +22110,11 @@
           7.0,
           8.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 67,
       "block_count": 88,
-      "is_feasible": true,
-      "hpwl_gap": -0.019060519902010402,
-      "area_gap": 0.04529354456154642,
-      "violations_relative": 0.0196078431372549,
-      "runtime_seconds": 1.5345418453216553,
-      "cost": 1.0635472968352375,
       "positions": [
         [
           127.23472801288774,
@@ -23120,18 +22644,11 @@
           38.7823423148582,
           21.48995972427175
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 68,
       "block_count": 89,
-      "is_feasible": true,
-      "hpwl_gap": 0.02799826587418035,
-      "area_gap": 0.1670425320751706,
-      "violations_relative": 0.11538461538461539,
-      "runtime_seconds": 3.623356819152832,
-      "cost": 1.382402162436256,
       "positions": [
         [
           60.30104119088318,
@@ -23667,18 +23184,11 @@
           9.293393104209592,
           32.63027791302853
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 69,
       "block_count": 90,
-      "is_feasible": true,
-      "hpwl_gap": 0.0033023370456875846,
-      "area_gap": 0.03191591946613029,
-      "violations_relative": 0.09615384615384616,
-      "runtime_seconds": 2.1163125038146973,
-      "cost": 1.2333864236378362,
       "positions": [
         [
           123.0,
@@ -24220,18 +23730,11 @@
           17.905209037759807,
           28.891145768626092
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 70,
       "block_count": 91,
-      "is_feasible": true,
-      "hpwl_gap": 0.00013955072859051494,
-      "area_gap": 0.024117199207067522,
-      "violations_relative": 0.0847457627118644,
-      "runtime_seconds": 4.702009916305542,
-      "cost": 1.1990708209467706,
       "positions": [
         [
           54.10879812622266,
@@ -24779,18 +24282,11 @@
           8.759042067818974,
           25.456550748113685
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 71,
       "block_count": 92,
-      "is_feasible": true,
-      "hpwl_gap": 0.002234780996457318,
-      "area_gap": 0.025639340775355957,
-      "violations_relative": 0.0196078431372549,
-      "runtime_seconds": 1.9001972675323486,
-      "cost": 1.0544892425184316,
       "positions": [
         [
           0.0,
@@ -25344,18 +24840,11 @@
           19.0,
           14.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 72,
       "block_count": 93,
-      "is_feasible": true,
-      "hpwl_gap": 0.0013517704610241624,
-      "area_gap": 0.022122734435840105,
-      "violations_relative": 0.017543859649122806,
-      "runtime_seconds": 1.0681486129760742,
-      "cost": 1.0478669528847577,
       "positions": [
         [
           8.816663418375722,
@@ -25915,18 +25404,11 @@
           24.25533161341232,
           16.669654608453783
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 73,
       "block_count": 94,
-      "is_feasible": true,
-      "hpwl_gap": 0.002048299830852883,
-      "area_gap": 0.016045136065475543,
-      "violations_relative": 0.03571428571428571,
-      "runtime_seconds": 2.0387189388275146,
-      "cost": 1.0837579806046287,
       "positions": [
         [
           109.28109136224333,
@@ -26492,18 +25974,11 @@
           20.748041749144605,
           10.316925577400843
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 74,
       "block_count": 95,
-      "is_feasible": true,
-      "hpwl_gap": -0.004421009977392367,
-      "area_gap": 0.014496911492221242,
-      "violations_relative": 0.045454545454545456,
-      "runtime_seconds": 2.0015060901641846,
-      "cost": 1.1031077270940886,
       "positions": [
         [
           26.985787855101776,
@@ -27075,18 +26550,11 @@
           27.16605608958698,
           26.556965298836435
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 75,
       "block_count": 96,
-      "is_feasible": true,
-      "hpwl_gap": 0.01487022166338009,
-      "area_gap": 0.046955681633410344,
-      "violations_relative": 0.05172413793103448,
-      "runtime_seconds": 1.828021764755249,
-      "cost": 1.1432705361389428,
       "positions": [
         [
           112.30425202100237,
@@ -27664,18 +27132,11 @@
           14.987026816471838,
           12.365161290271166
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 76,
       "block_count": 97,
-      "is_feasible": true,
-      "hpwl_gap": 0.012344152868811938,
-      "area_gap": 0.05521007278714962,
-      "violations_relative": 0.01694915254237288,
-      "runtime_seconds": 2.1033778190612793,
-      "cost": 1.0694211274986465,
       "positions": [
         [
           109.0186706679456,
@@ -28259,18 +27720,11 @@
           11.208261790209258,
           8.488024621244705
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 77,
       "block_count": 98,
-      "is_feasible": true,
-      "hpwl_gap": -0.0022859328198018905,
-      "area_gap": 0.019556203031525228,
-      "violations_relative": 0.05660377358490566,
-      "runtime_seconds": 2.5286712646484375,
-      "cost": 1.1308144806405853,
       "positions": [
         [
           17.94733313919065,
@@ -28860,18 +28314,11 @@
           27.18298933724676,
           27.561206282024763
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 78,
       "block_count": 99,
-      "is_feasible": true,
-      "hpwl_gap": 0.013938452833764728,
-      "area_gap": 0.03472737851931259,
-      "violations_relative": 0.04918032786885246,
-      "runtime_seconds": 2.662587881088257,
-      "cost": 1.1302086282837778,
       "positions": [
         [
           27.869236074825945,
@@ -29467,18 +28914,11 @@
           16.586533197603266,
           10.515518286882344
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 79,
       "block_count": 100,
-      "is_feasible": true,
-      "hpwl_gap": 0.014805468854224603,
-      "area_gap": 0.05129148669748379,
-      "violations_relative": 0.12727272727272726,
-      "runtime_seconds": 3.5396406650543213,
-      "cost": 1.3325035919438277,
       "positions": [
         [
           54.04450507974792,
@@ -30080,18 +29520,11 @@
           24.911297147157438,
           12.889091499929068
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 80,
       "block_count": 101,
-      "is_feasible": true,
-      "hpwl_gap": 0.01545293795969111,
-      "area_gap": 0.03271323496612314,
-      "violations_relative": 0.015873015873015872,
-      "runtime_seconds": 2.75909161567688,
-      "cost": 1.0571152058619855,
       "positions": [
         [
           107.00000000000001,
@@ -30699,18 +30132,11 @@
           19.0,
           18.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 81,
       "block_count": 102,
-      "is_feasible": true,
-      "hpwl_gap": 0.017277448576354142,
-      "area_gap": 0.04015008830108181,
-      "violations_relative": 0.034482758620689655,
-      "runtime_seconds": 2.0591278076171875,
-      "cost": 1.1021631740727205,
       "positions": [
         [
           93.44693682896734,
@@ -31324,18 +30750,11 @@
           11.800741252675207,
           21.162399181714758
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 82,
       "block_count": 103,
-      "is_feasible": true,
-      "hpwl_gap": -0.00011610249102245397,
-      "area_gap": 0.019671445458001924,
-      "violations_relative": 0.01694915254237288,
-      "runtime_seconds": 1.8821144104003906,
-      "cost": 1.0446542526318818,
       "positions": [
         [
           72.01581303535964,
@@ -31955,18 +31374,11 @@
           17.358109725264228,
           29.973021332444173
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 83,
       "block_count": 104,
-      "is_feasible": true,
-      "hpwl_gap": 0.009604451661102359,
-      "area_gap": 0.057485978440805136,
-      "violations_relative": 0.01818181818181818,
-      "runtime_seconds": 1.9324054718017578,
-      "cost": 1.0718203718021957,
       "positions": [
         [
           120.42767646459743,
@@ -32592,18 +32004,11 @@
           19.130177104618983,
           19.892341410099945
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 84,
       "block_count": 105,
-      "is_feasible": true,
-      "hpwl_gap": 0.0027274197861599497,
-      "area_gap": 0.022388118865660188,
-      "violations_relative": 0.03225806451612903,
-      "runtime_seconds": 2.0168793201446533,
-      "cost": 1.0800374360315235,
       "positions": [
         [
           17.187964036094677,
@@ -33235,18 +32640,11 @@
           22.283105870921542,
           22.236577096156438
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 85,
       "block_count": 106,
-      "is_feasible": true,
-      "hpwl_gap": 0.009107110933745236,
-      "area_gap": 0.02969713085263567,
-      "violations_relative": 0.0,
-      "runtime_seconds": 2.033581495285034,
-      "cost": 1.0194021208931905,
       "positions": [
         [
           43.070473939205876,
@@ -33884,18 +33282,11 @@
           11.734523767700814,
           20.859558908887678
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 86,
       "block_count": 107,
-      "is_feasible": true,
-      "hpwl_gap": 0.0020757068745047686,
-      "area_gap": 0.03399145322009111,
-      "violations_relative": 0.01818181818181818,
-      "runtime_seconds": 2.6414568424224854,
-      "cost": 1.0557342962684237,
       "positions": [
         [
           68.0,
@@ -34539,18 +33930,11 @@
           12.66249323389185,
           13.774222404526027
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 87,
       "block_count": 108,
-      "is_feasible": true,
-      "hpwl_gap": 0.003710316583712948,
-      "area_gap": 0.029509756857687443,
-      "violations_relative": 0.0,
-      "runtime_seconds": 1.8161332607269287,
-      "cost": 1.0166100367207003,
       "positions": [
         [
           14.0,
@@ -35200,18 +34584,11 @@
           25.012552491952324,
           12.1237530210907
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 88,
       "block_count": 109,
-      "is_feasible": true,
-      "hpwl_gap": 0.00018658075843817876,
-      "area_gap": 0.020474989226188383,
-      "violations_relative": 0.047619047619047616,
-      "runtime_seconds": 2.407200336456299,
-      "cost": 1.1112837541968783,
       "positions": [
         [
           127.89997075650382,
@@ -35867,18 +35244,11 @@
           8.0,
           6.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 89,
       "block_count": 110,
-      "is_feasible": true,
-      "hpwl_gap": 0.0224421218294245,
-      "area_gap": 0.11549628962428206,
-      "violations_relative": 0.1509433962264151,
-      "runtime_seconds": 5.537638187408447,
-      "cost": 1.4456826287639386,
       "positions": [
         [
           40.711214039942604,
@@ -36540,18 +35910,11 @@
           9.397524380405393,
           10.439877524397463
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 90,
       "block_count": 111,
-      "is_feasible": true,
-      "hpwl_gap": 0.006640209024017884,
-      "area_gap": 0.02753476255289692,
-      "violations_relative": 0.06060606060606061,
-      "runtime_seconds": 2.455857992172241,
-      "cost": 1.148153796463929,
       "positions": [
         [
           9.0,
@@ -37219,18 +36582,11 @@
           21.0,
           25.0
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 91,
       "block_count": 112,
-      "is_feasible": true,
-      "hpwl_gap": 0.004987098355069938,
-      "area_gap": 0.02100737936317805,
-      "violations_relative": 0.05172413793103448,
-      "runtime_seconds": 2.976224184036255,
-      "cost": 1.1234022179330743,
       "positions": [
         [
           44.31515149980372,
@@ -37904,18 +37260,11 @@
           24.11231995103596,
           21.042852471147395
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 92,
       "block_count": 113,
-      "is_feasible": true,
-      "hpwl_gap": -0.0008310923172798293,
-      "area_gap": 0.0359021472301744,
-      "violations_relative": 0.05357142857142857,
-      "runtime_seconds": 2.101118803024292,
-      "cost": 1.1330744754310067,
       "positions": [
         [
           46.430890498320764,
@@ -38595,18 +37944,11 @@
           9.01368791922553,
           3.9579802887480646
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 93,
       "block_count": 114,
-      "is_feasible": true,
-      "hpwl_gap": 0.009128568807277323,
-      "area_gap": 0.033972998571347446,
-      "violations_relative": 0.03225806451612903,
-      "runtime_seconds": 2.2217774391174316,
-      "cost": 1.0896297698908644,
       "positions": [
         [
           24.0,
@@ -39292,18 +38634,11 @@
           14.144907023268805,
           13.451626380522622
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 94,
       "block_count": 115,
-      "is_feasible": true,
-      "hpwl_gap": 0.0012522416191260925,
-      "area_gap": 0.03359926958163841,
-      "violations_relative": 0.015384615384615385,
-      "runtime_seconds": 1.6348316669464111,
-      "cost": 1.049217763066594,
       "positions": [
         [
           31.48394750335955,
@@ -39995,18 +39330,11 @@
           26.329873191732208,
           11.743011163056863
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 95,
       "block_count": 116,
-      "is_feasible": true,
-      "hpwl_gap": -0.0007199663868686358,
-      "area_gap": 0.03158474409184692,
-      "violations_relative": 0.0,
-      "runtime_seconds": 1.3731715679168701,
-      "cost": 1.0157923720459234,
       "positions": [
         [
           91.71967286984574,
@@ -40704,18 +40032,11 @@
           11.172024963284388,
           6.830185368186751
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 96,
       "block_count": 117,
-      "is_feasible": true,
-      "hpwl_gap": 0.009323886756193594,
-      "area_gap": 0.03644009045843029,
-      "violations_relative": 0.06153846153846154,
-      "runtime_seconds": 3.3857851028442383,
-      "cost": 1.1568502904451305,
       "positions": [
         [
           49.48372537496541,
@@ -41419,18 +40740,11 @@
           13.170854038288281,
           21.744908169293574
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 97,
       "block_count": 118,
-      "is_feasible": true,
-      "hpwl_gap": 0.0012256077271244736,
-      "area_gap": 0.01370464654055239,
-      "violations_relative": 0.03333333333333333,
-      "runtime_seconds": 2.8435475826263428,
-      "cost": 1.0769188720699812,
       "positions": [
         [
           82.3249187218759,
@@ -42140,18 +41454,11 @@
           9.016840787231954,
           12.858938461461115
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 98,
       "block_count": 119,
-      "is_feasible": true,
-      "hpwl_gap": 0.002191336850327557,
-      "area_gap": 0.019381745972680258,
-      "violations_relative": 0.019230769230769232,
-      "runtime_seconds": 2.3987607955932617,
-      "cost": 1.0504202478206426,
       "positions": [
         [
           24.07345553143557,
@@ -42867,18 +42174,11 @@
           17.111257396446778,
           8.918923396893293
         ]
-      ],
-      "error": null
+      ]
     },
     {
       "test_id": 99,
       "block_count": 120,
-      "is_feasible": true,
-      "hpwl_gap": 0.004970255423268394,
-      "area_gap": 0.020547962326889702,
-      "violations_relative": 0.029850746268656716,
-      "runtime_seconds": 4.8016884326934814,
-      "cost": 1.0750636722187923,
       "positions": [
         [
           95.39098769196498,
@@ -43600,14 +42900,7 @@
           22.522101050667853,
           8.712242028750323
         ]
-      ],
-      "error": null
+      ]
     }
-  ],
-  "summary": {
-    "num_tests": 100,
-    "num_feasible": 100,
-    "avg_cost": 1.1059371373047555,
-    "avg_runtime": 1.53175279378891
-  }
+  ]
 }

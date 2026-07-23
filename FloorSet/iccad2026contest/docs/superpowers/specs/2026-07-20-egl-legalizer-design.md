@@ -114,6 +114,41 @@ best post-snap proxy wins. If ≥ 2 boundary violations remain and preplaced anc
 exist, one `span=True` retry drives the extents into the anchors' span (aggressive
 reshaping pays only where anchors are otherwise unsatisfiable).
 
+## Stage-2 additions (2026-07-23)
+
+Diagnosis on v2 predictions (weighted proxy 1.1334): HPWL is solved (gap +0.009),
+the residual is **area_gap +0.044** and **grouping violations = 168 across 89/100
+cases** (boundary 50, MIB 0). 148/162 open cluster gaps were within 0.05·S — fragments
+essentially touching but diagonally offset, which the single-axis snapping cannot
+connect. Two additions target exactly this:
+
+### Area-shrink (uses the 1% soft-area budget)
+The contest checks soft-block area with a **strict** `|realized−target|/target > 0.01`,
+so `0.991·aᵢ` (diff 0.009) is feasible. Every soft (non-fixed, non-preplaced) block's
+dims are scaled by `√0.991` at stamping — freeing ~1% packing slack for a tighter bbox.
+Applied before MIB tying so an all-soft MIB group scales uniformly (stays identical); a
+group with a frozen member inherits the exact frozen dims and is left unscaled.
+
+### Stage DP — 2D cluster-merge repair (`cluster_repair`)
+For each cluster group split into >1 touching-component (union-find with shapely
+`unary_union` semantics — corner touch does **not** connect), rigidly translate the
+smaller movable component so its nearest block abuts the other component **in 2D**:
+close the gap on the more-separated axis *and* shift perpendicular to create a shared
+edge ≥ delta (the piece single-axis snapping was missing). Each move is applied
+tentatively, reverted if it creates any overlap (global recheck), and kept only if the
+**exact official-cost proxy strictly improves** — so it can never regress feasibility
+or score. Loops to a local optimum; tries both move directions (smaller comp first,
+then larger) so a boxed-in fragment can still be reached by moving its neighbour.
+Runs once on the chosen per-candidate solution.
+
+**Measured (offline, v2 top-6 candidates, weighted proxy / grouping-violations):**
+baseline 1.1334 / 168 → area-shrink only 1.1247 / 177 → cluster-repair only 1.1102 / 85
+→ **both 1.1018 / 89**, avg 0.96 s/case (unchanged). Grouping violations roughly halved.
+
+**Remaining headroom (not implemented):** ~62 open pairs are still <0.02·S apart but
+blocked by a third block — closing them needs neighbour-displacement / ripple moves
+(classic detailed-placement), higher complexity and regression risk for a small gain.
+
 ## Seeds (look-ahead legalization, NTUplace §2.2)
 `legalize_best_of(top-k)`: run the pipeline per candidate, keep best proxy; stop
 early below 1.05; per-case exploration budget 4 s. (A longer-G escalation pass was
