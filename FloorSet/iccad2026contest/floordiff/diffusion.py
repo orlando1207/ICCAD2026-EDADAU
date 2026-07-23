@@ -1,9 +1,16 @@
 """Diffusion wrapper: cosine schedule, x0-prediction training loss (min-SNR weighted,
 frozen channels masked), DDIM sampler with inpainting of known channels, EMA.
 
-Per the imitation-first design (doc C.0/C.4/C.5): the loss is masked MSE to ground
-truth and nothing else; sampling is a plain conditional DDIM plus inpainting — no
-physics guidance, no polish.
+Per the imitation-first design (doc C.0/C.4/C.5): the primary loss is masked MSE to
+ground truth; sampling is a plain conditional DDIM plus inpainting — no physics
+guidance, no polish.
+
+Optional auxiliary term (`edge_weight` > 0): a connectivity-weighted relative-position
+loss on b2b-connected block pairs. This is still pure imitation — it supervises the
+predicted *center differences* of connected blocks toward the GT center differences,
+weighted by net strength — but it focuses model capacity on exactly the relative
+arrangement that weighted HPWL rewards, rather than treating every block's absolute
+position as equally important.
 """
 
 import copy
@@ -43,7 +50,7 @@ class FloorDiffusion(nn.Module):
 
     # ------------------------------------------------------------------ training
 
-    def loss(self, batch):
+    def loss(self, batch, edge_weight=0.0):
         z0, feat, pair, gfeat = batch['z0'], batch['feat'], batch['pair'], batch['gfeat']
         freeze = batch['freeze']                                  # (B, N, 3) bool
         B = z0.shape[0]
@@ -58,10 +65,26 @@ class FloorDiffusion(nn.Module):
         x0_pred = self.model(z_t, t, feat, pair, gfeat, self_cond=self_cond)
 
         snr = self.alphas_bar[t] / (1 - self.alphas_bar[t])
-        w = snr.clamp(max=self.min_snr_gamma)[:, None, None]      # min-SNR for x0-param
+        wsnr = snr.clamp(max=self.min_snr_gamma)                  # min-SNR for x0-param
+        w = wsnr[:, None, None]
         mask = (~freeze).float()
         per = F.mse_loss(x0_pred, z0, reduction='none') * mask * w
-        return per.sum() / (mask * w).sum().clamp(min=1e-8)
+        main = per.sum() / (mask * w).sum().clamp(min=1e-8)
+        if edge_weight <= 0:
+            return main
+
+        # connectivity-weighted relative-position term (center channels only).
+        # pair[..., 0] is the symmetric log-b2b-weight matrix built in featurize,
+        # so it doubles as a dense per-edge weight -> no extra data plumbing.
+        W = pair[..., 0]                                          # (B, N, N) >= 0
+        cp = x0_pred[..., :2]                                     # (B, N, 2)
+        cg = z0[..., :2]
+        dpred = cp[:, :, None, :] - cp[:, None, :, :]             # (B, N, N, 2)
+        dgt = cg[:, :, None, :] - cg[:, None, :, :]
+        se = ((dpred - dgt) ** 2).sum(-1)                         # (B, N, N)
+        Ws = W * wsnr[:, None, None]
+        edge = (Ws * se).sum() / Ws.sum().clamp(min=1e-8)
+        return main + edge_weight * edge
 
     # ------------------------------------------------------------------ sampling
 

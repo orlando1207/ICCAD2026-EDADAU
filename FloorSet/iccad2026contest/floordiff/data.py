@@ -39,7 +39,15 @@ Z_DIM = 3
 
 N_FEAT = 24            # per-block static features
 N_GLOBAL = 12          # per-case global features
-N_PAIR = 3             # pairwise (attention-bias) features
+# pairwise (attention-bias) features:
+#   [0] log b2b connectivity strength
+#   [1] same-MIB-group indicator
+#   [2] same-cluster-group indicator
+#   [3:9] netlist shortest-path hop buckets (Graphormer spatial encoding):
+#         hop==1, ==2, ==3, ==4, 5<=hop<inf, disconnected
+#   [9] share >=1 required boundary side
+N_PAIR = 10
+_HOP_BUCKETS = 6
 
 
 # --------------------------------------------------------------------------- raw cases
@@ -125,6 +133,34 @@ def group_lists(gids):
         if g > 0:
             out.append(torch.nonzero(gids == g).flatten())
     return out
+
+
+def hop_buckets(n, b2b):
+    """Graphormer-style spatial encoding: (n, n, _HOP_BUCKETS) one-hot of the
+    unweighted netlist shortest-path distance between blocks, bucketed as
+    {1, 2, 3, 4, 5<=d<inf, disconnected}. Self (d=0) maps to all-zero."""
+    buck = torch.zeros(n, n, _HOP_BUCKETS)
+    if len(b2b) == 0:
+        buck[..., 5] = 1.0                      # everything disconnected
+        idx = torch.arange(n)
+        buck[idx, idx, 5] = 0.0
+        return buck
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import shortest_path
+    i = b2b[:, 0].long().numpy()
+    j = b2b[:, 1].long().numpy()
+    data = torch.ones(len(b2b)).numpy()
+    adj = csr_matrix((data, (i, j)), shape=(n, n))
+    adj = adj + adj.T                            # undirected
+    d = shortest_path(adj, method='D', unweighted=True, directed=False)
+    d = torch.from_numpy(d)                      # inf for unreachable, 0 on diag
+    buck[..., 0] = (d == 1)
+    buck[..., 1] = (d == 2)
+    buck[..., 2] = (d == 3)
+    buck[..., 3] = (d == 4)
+    buck[..., 4] = (d >= 5) & torch.isfinite(d)
+    buck[..., 5] = torch.isinf(d)
+    return buck
 
 
 def featurize(case):
@@ -252,6 +288,12 @@ def featurize(case):
         pair[g[:, None], g[None, :], 1] = 1.0
     for g in clu_g:
         pair[g[:, None], g[None, :], 2] = 1.0
+    pair[:, :, 3:3 + _HOP_BUCKETS] = hop_buckets(n, b2b)
+    # share >=1 required boundary side (blocks that must hug the same edge tend
+    # to line up along it) -> AND of the 4-bit boundary masks, any bit set
+    bb = cons[:, 4].long()
+    share = ((bb[:, None] & bb[None, :]) > 0).float()
+    pair[:, :, 3 + _HOP_BUCKETS] = share
 
     if len(pins):
         tw = pins[:, 0].max() - pins[:, 0].min()

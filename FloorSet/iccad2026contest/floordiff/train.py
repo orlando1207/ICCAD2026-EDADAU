@@ -54,9 +54,13 @@ def main():
     ap.add_argument('--batch-size', type=int, default=64)
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--warmup', type=int, default=1000)
-    ap.add_argument('--d-model', type=int, default=256)
-    ap.add_argument('--n-layers', type=int, default=8)
+    ap.add_argument('--d-model', type=int, default=384)
+    ap.add_argument('--n-layers', type=int, default=12)
     ap.add_argument('--n-heads', type=int, default=8)
+    ap.add_argument('--ffn', type=str, default='swiglu', choices=['swiglu', 'gelu'])
+    ap.add_argument('--no-qk-norm', action='store_true')
+    ap.add_argument('--edge-loss-weight', type=float, default=0.25,
+                    help='connectivity-weighted relative-position aux loss (0=off)')
     ap.add_argument('--timesteps', type=int, default=1000)
     ap.add_argument('--max-files', type=int, default=0, help='limit shards (smoke)')
     ap.add_argument('--no-augment', action='store_true')
@@ -87,7 +91,8 @@ def main():
                         persistent_workers=args.num_workers > 0)
 
     cfg = ModelConfig(d_model=args.d_model, n_layers=args.n_layers,
-                      n_heads=args.n_heads)
+                      n_heads=args.n_heads, ffn=args.ffn,
+                      qk_norm=not args.no_qk_norm)
     model = FloorDiffNet(cfg).to(device)
     diffusion = FloorDiffusion(model, timesteps=args.timesteps).to(device)
     ema = EMA(model)
@@ -126,7 +131,7 @@ def main():
             g['lr'] = lr_at(step)
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         with autocast:
-            loss = diffusion.loss(batch)
+            loss = diffusion.loss(batch, edge_weight=args.edge_loss_weight)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
