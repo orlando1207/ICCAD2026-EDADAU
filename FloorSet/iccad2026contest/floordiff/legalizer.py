@@ -53,6 +53,11 @@ DEFAULT_CFG = {
                              # strict diff>0.01 check, so 0.991 (diff 0.009) is safe
     'cluster_moves': 48,     # max rigid component merges per cluster_repair call
     'cluster_drag_rel': 0.30,  # skip merges needing a drag beyond this x S
+    'perp_align': True,      # stage DP-1: shared-edge repair within graph slack
+    'perp_moves': 40,        # max slack shifts per cluster_perp_align call
+    'cluster_align': True,   # stage L: band-align cluster members at assignment
+                             # time (while slack still exists) so abutting
+                             # members share an edge instead of a corner
 }
 
 _EPS_OVL = 1e-6              # official: pair violates only if BOTH axes > 1e-6
@@ -999,6 +1004,125 @@ def _closest_pair(sol, A, B):
     return best
 
 
+def _shift_slack(moving, m, preds, succs, pos, size):
+    """[lo, hi] for block m's position on one axis, ignoring graph neighbours in
+    `moving` (they translate with m, so they cannot constrain it)."""
+    lo, hi = -np.inf, np.inf
+    for p in preds[m]:
+        if int(p) in moving:
+            continue
+        lo = max(lo, float(pos[p] + size[p]))
+    for s in succs[m]:
+        if int(s) in moving:
+            continue
+        hi = min(hi, float(pos[s]) - float(size[m]))
+    return lo, hi
+
+
+def cluster_perp_align(sol, case, adjH, adjV, pre_mask, cfg, S,
+                       hpwl_base, area_base, n_soft):
+    """Stage DP-1: give split cluster components a real SHARED EDGE.
+
+    Measured dominant residual (70 of 71 violating groups): the two components
+    already touch along one axis -- 68 of them at gap exactly 0 -- but their
+    intervals on the *other* axis are disjoint, so they meet at a corner and
+    shapely's unary_union still reports two pieces. The needed correction is
+    often tiny (a few thousandths of S).
+
+    `cluster_repair` computes the right 2D move but applies it as a rigid
+    component translation validated against free space, and at ~97% packing
+    utilisation `max_penetration` rejects nearly all of them. This stage instead
+    moves within **constraint-graph slack**: shifting a block along axis p can
+    only collide with its p-graph neighbours (any other pair is kept apart by the
+    other axis' edge), so the slack interval is an exact feasibility bound and
+    needs no free space at all -- the same argument `polish` relies on.
+
+    Tries the cheapest repair first: one block, then its whole component. Every
+    move is gated on the exact official-cost proxy, so wirelength paid can never
+    exceed the violation removed.
+    """
+    cons = case['cons'].numpy()
+    groups = [np.nonzero(cons[:, 3] == g)[0] for g in np.unique(cons[:, 3])
+              if g > 0]
+    if not groups:
+        return sol
+    delta = cfg['delta_rel'] * S
+    adj = (adjH, adjV)
+    base = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+    if base >= 10.0:
+        return sol                                # infeasible input: leave it
+    moves, cap = 0, int(cfg.get('perp_moves', 40))
+    improved = True
+    while improved and moves < cap:
+        improved = False
+        for mem in groups:
+            comps = _touch_components(sol, mem)
+            if len(comps) <= 1:
+                continue
+            pairs = sorted(((ia, ib) for ia in range(len(comps))
+                            for ib in range(ia + 1, len(comps))),
+                           key=lambda p: _closest_pair(sol, comps[p[0]],
+                                                       comps[p[1]])[0])
+            for ia, ib in pairs:
+                A, B = comps[ia], comps[ib]
+                _sep, a, b = _closest_pair(sol, A, B)
+                gx = (max(sol[a, 0], sol[b, 0])
+                      - min(sol[a, 0] + sol[a, 2], sol[b, 0] + sol[b, 2]))
+                gy = (max(sol[a, 1], sol[b, 1])
+                      - min(sol[a, 1] + sol[a, 3], sol[b, 1] + sol[b, 3]))
+                # the axis they are DISJOINT on is the one needing overlap; the
+                # other one already abuts and must not be disturbed
+                sep = 0 if gx >= gy else 1
+                preds, succs = adj[sep]
+
+                # a shift along `sep` can drag a block off a boundary wall it is
+                # sitting on, trading a grouping fix for a boundary violation --
+                # so try movers that are unconstrained on this axis first
+                bits_ax = (1 | 2) if sep == 0 else (4 | 8)
+                cons_bits = cons[:, 4]
+                trials = []
+                for m, f, comp in ((b, a, B), (a, b, A)):
+                    if pre_mask[m]:
+                        continue
+                    pin = 1 if int(cons_bits[m]) & bits_ax else 0
+                    trials.append((pin, int(m), int(f), [int(m)]))
+                    if len(comp) > 1 and not any(pre_mask[i] for i in comp):
+                        cpin = 1 if any(int(cons_bits[i]) & bits_ax for i in comp) \
+                            else 0
+                        trials.append((cpin, int(m), int(f),
+                                       [int(i) for i in comp]))
+                trials = [t[1:] for t in sorted(trials, key=lambda t: t[0])]
+
+                for m, f, grp in trials:
+                    need = _perp_shift(sol[m, sep], sol[m, 2 + sep],
+                                       sol[f, sep], sol[f, 2 + sep], delta)
+                    if need == 0.0:
+                        continue
+                    moving = set(grp)
+                    lo_d, hi_d = -np.inf, np.inf
+                    for i in grp:
+                        lo, hi = _shift_slack(moving, i, preds, succs,
+                                              sol[:, sep], sol[:, 2 + sep])
+                        lo_d = max(lo_d, lo - sol[i, sep])
+                        hi_d = min(hi_d, hi - sol[i, sep])
+                    d = min(max(need, lo_d), hi_d)
+                    if not np.isfinite(d) or abs(d) < 1e-12:
+                        continue
+                    idx = np.array(grp)
+                    old = sol[idx].copy()
+                    sol[idx, sep] += d
+                    ok = max_penetration(sol) <= _EPS_OVL
+                    c = (proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+                         if ok else np.inf)
+                    if ok and c <= base - 1e-12:
+                        base, improved, moves = c, True, moves + 1
+                        break
+                    sol[idx] = old
+                if improved:
+                    break                         # components changed: recompute
+    return sol
+
+
 def cluster_repair(sol, case, pre_mask, cfg, S, hpwl_base, area_base, n_soft):
     """Detailed-placement cluster-grouping repair. For each cluster group that
     is split into >1 touching-component, rigidly translate the smaller movable
@@ -1108,6 +1232,8 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         pred[mem, 3] = pred[rep, 3]
     shrinkable = (~pre_mask) & (~fixed_mask) & (cons[:, 2] == 0)
     areas = pred[:, 2] * pred[:, 3]
+    clu_groups = [np.nonzero(cons[:, 3] == g)[0]
+                  for g in np.unique(cons[:, 3]) if g > 0]
 
     hpwl_base, area_base = _baselines(case, pred)
     n_soft = _n_soft_norm(cons)
@@ -1208,8 +1334,31 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
                         ints[ax].setdefault(int(fol), int(ld))
             return ints
 
+        def cluster_align(axis):
+            """Targets pulling a cluster group's members onto a common band on
+            `axis`. Members that abut along the *other* axis then land with
+            overlapping intervals, i.e. a real shared edge, instead of meeting
+            at a corner -- which the measurements show is the dominant grouping
+            failure, and which is 98% unrepairable after packing because the
+            slack is gone. Applied only perpendicular to the group's spread
+            direction, so the group stays free to stretch along its strip."""
+            out = {}
+            for mem in clu_groups:
+                if len(mem) < 2:
+                    continue
+                cx = sol[mem, 0] + sol[mem, 2] / 2
+                cy = sol[mem, 1] + sol[mem, 3] / 2
+                spread = 0 if (cx.max() - cx.min()) >= (cy.max() - cy.min()) else 1
+                if axis == spread:
+                    continue
+                band = float(np.median(sol[mem, axis] + sol[mem, 2 + axis] / 2))
+                for i in mem:
+                    if not pre_mask[i]:
+                        out[int(i)] = band - float(sol[i, 2 + axis]) / 2
+            return out
+
         def assign(axis, edges, order, use_wall=True, pin=True,
-                   contact=None):
+                   contact=None, align=None):
             pos, size = sol[:, axis], sol[:, 2 + axis]
             lo_bit, hi_bit = (1, 8)[axis], (2, 4)[axis]
             wl = wall_lo[axis] if (use_wall and pin) else None
@@ -1235,6 +1384,10 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
                     if not pre_mask[i] and int(bits[i]) & hi_bit:
                         target[i] = wall - size[i]
                         bnd_set.add(int(i))
+            # cluster band < boundary wall < exact-abutment contact
+            for i, t in (align or {}).items():
+                if i not in bnd_set:
+                    target[i] = t
             con = {f: l for f, l in (contact or {}).items()
                    if f not in bnd_set}         # boundary intent wins
             sol[:, axis] = assign_axis(n, edges, target, size, pre_mask,
@@ -1243,8 +1396,10 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
 
         def do_assign(use_wall, pin):
             ints = contact_intents()
-            assign(0, H, ordx, use_wall, pin, ints[0])
-            assign(1, V, ordy, use_wall, pin, ints[1])
+            al = (cluster_align(0), cluster_align(1)) \
+                if cfg.get('cluster_align', True) else (None, None)
+            assign(0, H, ordx, use_wall, pin, ints[0], al[0])
+            assign(1, V, ordy, use_wall, pin, ints[1], al[1])
             return max_penetration(sol) <= _EPS_OVL
 
         # ladder: pinned walls -> unpinned walls -> wall-free repair +
@@ -1267,6 +1422,11 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         s, _H, _V, aH, aV = rr
         s = snap_soft(s.copy(), case, aH, aV, pre_mask, cfg, S, alpha,
                       n_soft, nbr_i)
+        # give still-split cluster groups a real shared edge, using graph slack
+        # (free space is already gone by this point -- see cluster_perp_align)
+        if cfg.get('perp_align', True):
+            s = cluster_perp_align(s, case, aH, aV, pre_mask, cfg, S,
+                                   hpwl_base, area_base, n_soft)
         return proxy_cost(s, case, hpwl_base, area_base, n_soft), s
 
     # G: short local overlap cleanup, then two graph rounds (the second

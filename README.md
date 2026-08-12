@@ -1,6 +1,9 @@
-analytical method: (dir: ./FloorSet/iccad2026contest/analytic_legalizer)
+# ICCAD 2026 FloorSet Challenge — cadc1111
 
-sequence pair algorithm (dir: ./FloorSet/iccad2026contest/sp-engine)
+Source-code submission using a diffusion model followed by legalization.
 
-DRL method (dir: ./FloorSet/iccad2026contest/CNN-RL)
+```bash
+python iccad2026_evaluate.py --evaluate op_wrapper.py
+```
 
+The model checkpoint is loaded once during optimizer initialization.
