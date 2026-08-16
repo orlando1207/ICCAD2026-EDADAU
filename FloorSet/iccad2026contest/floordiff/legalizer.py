@@ -13,6 +13,8 @@ Implements docs/superpowers/specs/2026-07-20-egl-legalizer-design.md:
   S      profit-gated exact snapping (boundary sides, cluster abutment)
   R      bounded DAG ripple repair for close cluster components blocked by
          neighboring rectangles
+  Q      bounded area-preserving reshape repair for residual group gaps and
+         preplaced boundary anchors
 
 No LP/MILP anywhere; vectorized numpy + small per-block loops. All edges are
 oriented by a FIXED per-axis total order (the G-phase centers), which keeps
@@ -73,6 +75,22 @@ DEFAULT_CFG = {
     'ripple_pair_choices': 2,
     'ripple_max_blocks': 20,
     'ripple_total_disp_rel': 0.30,
+    # Shape-aware detailed placement.  Residual group gaps are closed by
+    # elongating one soft block toward contact (area exact); small bbox sides
+    # beyond a preplaced boundary anchor are contracted by shrinking a critical
+    # path.  Every trial is proxy-gated and stays inside the entry bbox.
+    'reshape_repair': True,
+    'reshape_group': True,
+    'reshape_boundary': True,
+    'reshape_close_rel': 0.02,
+    'reshape_budget_s': 0.025,
+    'reshape_trials': 16,
+    'reshape_moves': 2,
+    'reshape_max_growth': 0.10,
+    'reshape_max_shrink': 0.10,
+    'reshape_aspect_cap': 3.6,
+    'reshape_max_blocks': 48,
+    'reshape_total_disp_rel': 0.20,
 }
 
 _EPS_OVL = 1e-6              # official: pair violates only if BOTH axes > 1e-6
@@ -1429,6 +1447,293 @@ def cluster_ripple_repair(sol, case, H, V, pre_mask, cfg, S,
     return sol, stats
 
 
+# ------------------------------------------------------------------ stage DP-3: shape-aware repair
+
+def _entry_walls(sol):
+    """Return immutable low/high walls for both axes."""
+    return [(float(sol[:, a].min()),
+             float((sol[:, a] + sol[:, 2 + a]).max())) for a in (0, 1)]
+
+
+def _assign_inside_walls(cand, target, H, V, fixed, walls):
+    """Ripple movable blocks inside ``walls``; return False on graph failure."""
+    n = len(cand)
+    ordx, ordy = _topological_order(n, H), _topological_order(n, V)
+    if ordx is None or ordy is None:
+        return False
+    fixed_pos = cand[:, :2].copy()
+    for axis, edges, order in ((0, H, ordx), (1, V, ordy)):
+        cand[:, axis] = assign_axis(
+            n, edges, target[:, axis], cand[:, 2 + axis], fixed,
+            fixed_pos[:, axis], order, wall_hi=walls[axis][1],
+            wall_lo=walls[axis][0])
+    if not _graph_is_legal(cand, H, 0) or not _graph_is_legal(cand, V, 1):
+        return False
+    if np.max(np.abs(cand[fixed, :2] - fixed_pos[fixed])) > 1e-7:
+        return False
+    for axis in (0, 1):
+        if cand[:, axis].min() < walls[axis][0] - 1e-7:
+            return False
+        if (cand[:, axis] + cand[:, 2 + axis]).max() \
+                > walls[axis][1] + 1e-7:
+            return False
+    return max_penetration(cand) <= _EPS_OVL
+
+
+def _group_reshape_candidates(sol, cons, shrinkable, close_cap,
+                              max_growth, delta):
+    """Rank simple one-axis group gaps that one endpoint can elongate across."""
+    out = []
+    for g in np.unique(cons[:, 3]):
+        if g == 0:
+            continue
+        mem = np.nonzero(cons[:, 3] == g)[0]
+        comps = _touch_components(sol, mem)
+        for ia in range(len(comps)):
+            for ib in range(ia + 1, len(comps)):
+                _sep, a, b = _closest_pair(sol, comps[ia], comps[ib])
+                for axis in (0, 1):
+                    other = 1 - axis
+                    alo, ahi = sol[a, axis], sol[a, axis] + sol[a, 2 + axis]
+                    blo, bhi = sol[b, axis], sol[b, axis] + sol[b, 2 + axis]
+                    gap = max(alo, blo) - min(ahi, bhi)
+                    ov = min(sol[a, other] + sol[a, 2 + other],
+                             sol[b, other] + sol[b, 2 + other]) \
+                        - max(sol[a, other], sol[b, other])
+                    if not (0.0 < gap <= close_cap and ov > delta):
+                        continue
+                    left, right = (a, b) if alo <= blo else (b, a)
+                    for grow, direction in ((left, 1), (right, -1)):
+                        if not shrinkable[grow]:
+                            continue
+                        rel = gap / max(sol[grow, 2 + axis], 1e-12)
+                        if rel <= max_growth + 1e-12:
+                            # Try center-preserving first, then preserve either
+                            # perpendicular face.  The latter variants often
+                            # retain an older contact in the same group.
+                            for perp_anchor in (0, -1, 1):
+                                out.append((gap, int(grow), int(left),
+                                            int(right), axis, direction,
+                                            perp_anchor))
+    out.sort(key=lambda z: (z[0], z[1], z[4]))
+    return out
+
+
+def _try_group_reshape(sol, rec, pre_mask, cfg, walls):
+    """Area-preserving elongation plus DAG ripple for one contact candidate."""
+    gap, grow, left, right, axis, direction, perp_anchor = rec
+    cand = sol.copy()
+    old_size = float(cand[grow, 2 + axis])
+    other = 1 - axis
+    area = float(cand[grow, 2] * cand[grow, 3])
+    new_size = old_size + gap
+    new_other = area / new_size
+    if max(new_size / new_other, new_other / new_size) \
+            > cfg['reshape_aspect_cap']:
+        return None
+
+    # Keep the face away from the gap fixed, and keep the perpendicular center.
+    if direction < 0:
+        cand[grow, axis] -= gap
+    old_other = cand[grow, 2 + other]
+    if perp_anchor > 0:                 # preserve high perpendicular face
+        cand[grow, other] += old_other - new_other
+    elif perp_anchor == 0:              # preserve perpendicular center
+        cand[grow, other] += 0.5 * (old_other - new_other)
+    cand[grow, 2 + axis] = new_size
+    cand[grow, 2 + other] = new_other
+
+    keyx = sol[:, 0] + sol[:, 2] / 2
+    keyy = sol[:, 1] + sol[:, 3] / 2
+    H, V = build_graph(sol, keyx, keyy)
+    leader, follower = left, right
+    H, V = _swap_contact_edge(H, V, left, right, axis, leader, follower)
+    fixed = pre_mask.copy()
+    fixed[[left, right]] = True
+    if not _assign_inside_walls(cand, sol, H, V, fixed, walls):
+        return None
+    return cand
+
+
+def _contract_high_wall(sol, axis, target_hi, pre_mask, shrinkable, cfg):
+    """Contract one high bbox side, reshaping its critical path if necessary."""
+    cand = sol.copy()
+    walls = _entry_walls(sol)
+    if target_hi <= walls[axis][0] + 1e-9:
+        return None
+    pre_edge = cand[:, axis] + cand[:, 2 + axis]
+    if (pre_edge[pre_mask] > target_hi + 1e-7).any():
+        return None
+    walls[axis] = (walls[axis][0], float(target_hi))
+
+    keyx = sol[:, 0] + sol[:, 2] / 2
+    keyy = sol[:, 1] + sol[:, 3] / 2
+    H, V = build_graph(sol, keyx, keyy)
+    orders = (_topological_order(len(sol), H),
+              _topological_order(len(sol), V))
+    if orders[0] is None or orders[1] is None:
+        return None
+    edges = H if axis == 0 else V
+    areas = cand[:, 2] * cand[:, 3]
+    for _ in range(3):
+        extent, _lb, path = min_extent(
+            len(cand), edges, cand[:, 2 + axis], pre_mask,
+            cand[:, axis], orders[axis], walls[axis][0])
+        excess = extent - target_hi
+        if excess <= 1e-8:
+            break
+        eligible = [v for v in path if shrinkable[v]]
+        if not eligible:
+            return None
+        total = sum(cand[v, 2 + axis] for v in eligible)
+        ratio = max(1.0 - excess / max(total, 1e-12),
+                    1.0 - float(cfg['reshape_max_shrink']))
+        accepted = []
+        for v in eligible:
+            old_axis = cand[v, 2 + axis]
+            old_other = cand[v, 3 - axis]
+            new_axis = old_axis * ratio
+            new_other = areas[v] / new_axis
+            old_ar = max(old_axis / old_other, old_other / old_axis)
+            new_ar = max(new_axis / new_other, new_other / new_axis)
+            # Permit an already-slender block when contraction improves it.
+            if new_ar <= max(float(cfg['reshape_aspect_cap']), old_ar) + 1e-12:
+                accepted.append(v)
+        if not accepted:
+            return None
+        total = sum(cand[v, 2 + axis] for v in accepted)
+        ratio = max(1.0 - excess / max(total, 1e-12),
+                    1.0 - float(cfg['reshape_max_shrink']))
+        got = 0.0
+        for v in accepted:
+            old_axis = cand[v, 2 + axis]
+            cand[v, 2 + axis] = old_axis * ratio
+            cand[v, 3 - axis] = areas[v] / cand[v, 2 + axis]
+            got += old_axis - cand[v, 2 + axis]
+        if got <= 1e-9:
+            return None
+    target = sol.copy()
+    if not _assign_inside_walls(cand, target, H, V, pre_mask, walls):
+        return None
+    return cand
+
+
+def _try_boundary_reshape(sol, rec, pre_mask, shrinkable, cfg):
+    """Contract a high side directly, or mirror a low side into a high side."""
+    _gap, _block, axis, high, target = rec
+    if high:
+        return _contract_high_wall(
+            sol, axis, target, pre_mask, shrinkable, cfg)
+    mirrored = sol.copy()
+    mirrored[:, axis] = -(sol[:, axis] + sol[:, 2 + axis])
+    cand = _contract_high_wall(
+        mirrored, axis, -target, pre_mask, shrinkable, cfg)
+    if cand is None:
+        return None
+    cand[:, axis] = -(cand[:, axis] + cand[:, 2 + axis])
+    return cand
+
+
+def shape_detail_repair(sol, case, pre_mask, shrinkable, cfg, S,
+                        hpwl_base, area_base, n_soft):
+    """Bounded reshape repair for residual group and boundary violations.
+
+    Trials preserve each changed block's area, never reshape fixed/preplaced/MIB
+    blocks, and reassign all movable blocks through an all-pair separation DAG.
+    A trial commits only when the exact official violation total and proxy cost
+    both improve.  This makes the heuristic safe to leave enabled globally.
+    """
+    t0 = time.perf_counter()
+    stats = {'trials': 0, 'moves': 0, 'group_moves': 0,
+             'boundary_moves': 0, 'reshaped_blocks': 0,
+             'viol_before': 0, 'viol_after': 0, 'runtime_s': 0.0}
+    cons = case['cons'].numpy()
+    before = _violations_official(sol, cons)
+    base_v = sum(before)
+    stats['viol_before'] = base_v
+    stats['viol_after'] = base_v
+    if base_v == 0:
+        return sol, stats
+
+    deadline = t0 + float(cfg['reshape_budget_s'])
+    trial_cap = int(cfg['reshape_trials'])
+    move_cap = int(cfg['reshape_moves'])
+    close_cap = float(cfg['reshape_close_rel']) * S
+    disp_cap = float(cfg['reshape_total_disp_rel']) * S
+    block_cap = int(cfg['reshape_max_blocks'])
+    delta = max(float(cfg['delta_rel']) * S, 1e-9)
+    base_cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+
+    while stats['moves'] < move_cap and stats['trials'] < trial_cap \
+            and time.perf_counter() < deadline:
+        records = []
+        if cfg.get('reshape_group', True):
+            for rec in _group_reshape_candidates(
+                    sol, cons, shrinkable, close_cap,
+                    float(cfg['reshape_max_growth']), delta):
+                records.append((rec[0], 0, rec))
+        if cfg.get('reshape_boundary', True):
+            x0, y0 = sol[:, 0], sol[:, 1]
+            x1, y1 = x0 + sol[:, 2], y0 + sol[:, 3]
+            lo, hi = (float(x0.min()), float(y0.min())), \
+                     (float(x1.max()), float(y1.max()))
+            for i in np.nonzero(pre_mask & (cons[:, 4] > 0))[0]:
+                bits = int(cons[i, 4])
+                for axis, low_bit, high_bit in ((0, 1, 2), (1, 8, 4)):
+                    if bits & high_bit:
+                        target = float(sol[i, axis] + sol[i, 2 + axis])
+                        gap = hi[axis] - target
+                        if 1e-8 < gap <= close_cap:
+                            records.append((gap, 1,
+                                            (gap, int(i), axis, True, target)))
+                    if bits & low_bit:
+                        target = float(sol[i, axis])
+                        gap = target - lo[axis]
+                        if 1e-8 < gap <= close_cap:
+                            records.append((gap, 1,
+                                            (gap, int(i), axis, False, target)))
+        records.sort(key=lambda z: (z[0], z[1]))
+        accepted = False
+        walls = _entry_walls(sol)
+        for _gap, kind, rec in records:
+            if stats['trials'] >= trial_cap or time.perf_counter() >= deadline:
+                break
+            stats['trials'] += 1
+            cand = _try_group_reshape(sol, rec, pre_mask, cfg, walls) \
+                if kind == 0 else _try_boundary_reshape(
+                    sol, rec, pre_mask, shrinkable, cfg)
+            if cand is None:
+                continue
+            changed_shape = np.nonzero(np.max(
+                np.abs(cand[:, 2:4] - sol[:, 2:4]), axis=1) > 1e-8)[0]
+            moved = np.nonzero(np.max(
+                np.abs(cand[:, :2] - sol[:, :2]), axis=1) > 1e-8)[0]
+            if len(np.union1d(changed_shape, moved)) > block_cap:
+                continue
+            if float(np.abs(cand[:, :2] - sol[:, :2]).sum()) > disp_cap:
+                continue
+            after = _violations_official(cand, cons)
+            total_v = sum(after)
+            if total_v >= base_v:
+                continue
+            cost = proxy_cost(cand, case, hpwl_base, area_base, n_soft)
+            if cost >= base_cost - 1e-12:
+                continue
+            sol = cand
+            base_v, base_cost = total_v, cost
+            stats['moves'] += 1
+            stats['group_moves' if kind == 0 else 'boundary_moves'] += 1
+            stats['reshaped_blocks'] += len(changed_shape)
+            stats['viol_after'] = total_v
+            accepted = True
+            break
+        if not accepted:
+            break
+
+    stats['runtime_s'] = time.perf_counter() - t0
+    return sol, stats
+
+
 # ------------------------------------------------------------------ driver
 
 def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
@@ -1702,16 +2007,30 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         sol = cluster_repair(sol, case, pre_mask, cfg, S, hpwl_base,
                              area_base, n_soft)
         cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+
+    # stage DP-3: target only violations left by every position-only repair.
+    # The graph is rebuilt per accepted move, so it reflects ripple and rigid
+    # component translations rather than relying on a stale legal-round DAG.
+    reshape_info = {'trials': 0, 'moves': 0, 'group_moves': 0,
+                    'boundary_moves': 0, 'reshaped_blocks': 0,
+                    'viol_before': 0, 'viol_after': 0, 'runtime_s': 0.0}
+    if cost < 9 and cfg.get('reshape_repair', True):
+        sol, reshape_info = shape_detail_repair(
+            sol, case, pre_mask, shrinkable, cfg, S, hpwl_base, area_base,
+            n_soft)
+        cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
     ripple_info['group_final'] = _violations_official(sol, cons)[1]
 
     pen = max_penetration(sol)
     info = {'proxy_cost': cost, 'penetration': pen,
             'move_mean': float(np.abs(sol[:, :2] - pred[:, :2]).mean() / S),
-            'runtime_s': time.time() - t0, 'ripple': ripple_info}
+            'runtime_s': time.time() - t0, 'ripple': ripple_info,
+            'reshape': reshape_info}
     if verbose:
         print(f"  proxy={cost:.4f} pen={pen:.2e} "
               f"move={info['move_mean']:.4f} "
               f"ripple={ripple_info['moves']}/{ripple_info['trials']} "
+              f"reshape={reshape_info['moves']}/{reshape_info['trials']} "
               f"t={info['runtime_s']:.2f}s")
     return torch.tensor(sol, dtype=torch.float64), info
 
