@@ -11,6 +11,8 @@ Implements docs/superpowers/specs/2026-07-20-egl-legalizer-design.md:
          construction)
   P      Abacus-style per-axis L1 median sweeps within fresh slack intervals
   S      profit-gated exact snapping (boundary sides, cluster abutment)
+  R      bounded DAG ripple repair for close cluster components blocked by
+         neighboring rectangles
 
 No LP/MILP anywhere; vectorized numpy + small per-block loops. All edges are
 oriented by a FIXED per-axis total order (the G-phase centers), which keeps
@@ -23,6 +25,7 @@ Run from iccad2026contest/:
 """
 
 import argparse
+import heapq
 import json
 import math
 import time
@@ -58,6 +61,18 @@ DEFAULT_CFG = {
     'cluster_align': True,   # stage L: band-align cluster members at assignment
                              # time (while slack still exists) so abutting
                              # members share an edge instead of a corner
+    # bounded ripple repair for close, blocked cluster components.  Each trial
+    # is a pair-edge swap plus two O(n^2) DAG assignments; strict caps keep this
+    # stage small relative to diffusion sampling and the two legal rounds.
+    'ripple_repair': True,
+    'ripple_close_rel': 0.025,
+    'ripple_drag_rel': 0.04,
+    'ripple_budget_s': 0.03,
+    'ripple_trials': 24,
+    'ripple_moves': 4,
+    'ripple_pair_choices': 2,
+    'ripple_max_blocks': 20,
+    'ripple_total_disp_rel': 0.30,
 }
 
 _EPS_OVL = 1e-6              # official: pair violates only if BOTH axes > 1e-6
@@ -1195,6 +1210,225 @@ def cluster_repair(sol, case, pre_mask, cfg, S, hpwl_base, area_base, n_soft):
     return sol
 
 
+# ------------------------------------------------------------------ stage DP-2: bounded ripple repair
+
+def _topological_order(n, edges):
+    """Deterministic topological order, or None if an edge swap made a cycle."""
+    succ = [[] for _ in range(n)]
+    indeg = np.zeros(n, dtype=np.int64)
+    for i, j in edges:
+        succ[i].append(j)
+        indeg[j] += 1
+    ready = [i for i in range(n) if indeg[i] == 0]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        i = heapq.heappop(ready)
+        order.append(i)
+        for j in succ[i]:
+            indeg[j] -= 1
+            if indeg[j] == 0:
+                heapq.heappush(ready, j)
+    return order if len(order) == n else None
+
+
+def _swap_contact_edge(H, V, a, b, axis, leader, follower):
+    """Move pair (a,b) to the contact axis with the requested orientation."""
+    pair = (min(a, b), max(a, b))
+    hc = [(i, j) for i, j in H if (min(i, j), max(i, j)) != pair]
+    vc = [(i, j) for i, j in V if (min(i, j), max(i, j)) != pair]
+    (hc if axis == 0 else vc).append((leader, follower))
+    return hc, vc
+
+
+def _graph_is_legal(sol, edges, axis, tol=1e-7):
+    pos, size = sol[:, axis], sol[:, 2 + axis]
+    return all(pos[j] + tol >= pos[i] + size[i] for i, j in edges)
+
+
+def _ripple_contact_plans(sol, anchor_comp, moving_comp, delta, pair_cap):
+    """Cheap exact-face plans, nearest block pairs first.
+
+    Returns (motion, contact_axis, leader, follower, anchor_block,
+    moving_block).  `motion` translates the complete moving component.  The
+    perpendicular part guarantees a positive shared edge rather than a corner.
+    """
+    pairs = []
+    for f in anchor_comp:
+        for m in moving_comp:
+            gx = max(sol[f, 0], sol[m, 0]) - min(
+                sol[f, 0] + sol[f, 2], sol[m, 0] + sol[m, 2])
+            gy = max(sol[f, 1], sol[m, 1]) - min(
+                sol[f, 1] + sol[f, 3], sol[m, 1] + sol[m, 3])
+            pairs.append((max(gx, gy), int(f), int(m)))
+    pairs.sort(key=lambda z: (z[0], z[1], z[2]))
+
+    plans = []
+    for _sep, f, m in pairs[:pair_cap]:
+        xf, yf, wf, hf = sol[f]
+        xm, ym, wm, hm = sol[m]
+        dy = _perp_shift(ym, hm, yf, hf, delta)
+        dx = _perp_shift(xm, wm, xf, wf, delta)
+        # moving block immediately right / left of the anchor
+        plans.append((np.array([xf + wf - xm, dy]), 0, f, m, f, m))
+        plans.append((np.array([xf - wm - xm, dy]), 0, m, f, f, m))
+        # moving block immediately above / below the anchor
+        plans.append((np.array([dx, yf + hf - ym]), 1, f, m, f, m))
+        plans.append((np.array([dx, yf - hm - ym]), 1, m, f, f, m))
+    plans.sort(key=lambda z: (abs(z[0][0]) + abs(z[0][1]), z[1],
+                              z[2], z[3]))
+    return plans
+
+
+def cluster_ripple_repair(sol, case, H, V, pre_mask, cfg, S,
+                          hpwl_base, area_base, n_soft):
+    """Reconnect close cluster components by bounded DAG ripple movement.
+
+    Existing single/component slides fail when an unrelated block occupies the
+    needed space.  For a candidate face contact this routine swaps the chosen
+    pair's separation edge onto the contact axis, pins both touching components
+    (one translated, one stationary), and re-runs minimal-movement assignment.
+    Blocks on the affected predecessor/successor chains ripple out of the way.
+
+    Every trial stays inside the entry bbox and preserves all graph separation
+    inequalities.  It is accepted only when official grouping count and the
+    exact proxy both strictly improve.  Trial, displacement, moved-block and
+    wall-clock caps bound the worst case.
+    """
+    t0 = time.perf_counter()
+    stats = {'trials': 0, 'moves': 0, 'moved_blocks': 0,
+             'group_before': 0, 'group_after': 0, 'runtime_s': 0.0}
+    cons = case['cons'].numpy()
+    groups = [np.nonzero(cons[:, 3] == g)[0]
+              for g in np.unique(cons[:, 3]) if g > 0]
+    if not groups:
+        return sol, stats
+
+    base_v = _violations_official(sol, cons)
+    base_vg = base_v[1]
+    stats['group_before'] = base_vg
+    stats['group_after'] = base_vg
+    if base_vg == 0:
+        return sol, stats
+
+    n = len(sol)
+    delta = cfg['delta_rel'] * S
+    close_cap = cfg['ripple_close_rel'] * S
+    drag_cap = cfg['ripple_drag_rel'] * S
+    deadline = t0 + cfg['ripple_budget_s']
+    trial_cap = int(cfg['ripple_trials'])
+    move_cap = int(cfg['ripple_moves'])
+    pair_cap = int(cfg['ripple_pair_choices'])
+    block_cap = int(cfg['ripple_max_blocks'])
+    disp_cap = float(cfg['ripple_total_disp_rel']) * S
+    walls = [(float(sol[:, a].min()),
+              float((sol[:, a] + sol[:, 2 + a]).max())) for a in (0, 1)]
+    base_cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+    H, V = list(H), list(V)
+
+    improved = True
+    while improved and stats['moves'] < move_cap \
+            and stats['trials'] < trial_cap and time.perf_counter() < deadline:
+        improved = False
+        # Recompute components after every accepted contact.  Component pairs
+        # are ordered by their closest rectangle gap, so cheap near misses win.
+        open_pairs = []
+        for mem in groups:
+            comps = _touch_components(sol, mem)
+            for ia in range(len(comps)):
+                for ib in range(ia + 1, len(comps)):
+                    sep, _a, _b = _closest_pair(sol, comps[ia], comps[ib])
+                    if max(0.0, sep) <= close_cap:
+                        open_pairs.append((max(0.0, sep), comps[ia], comps[ib]))
+        open_pairs.sort(key=lambda z: (z[0], len(z[1]) + len(z[2])))
+
+        for _sep, A, B in open_pairs:
+            directions = []
+            if not pre_mask[np.asarray(B, dtype=np.int64)].any():
+                directions.append((A, B))
+            if not pre_mask[np.asarray(A, dtype=np.int64)].any():
+                directions.append((B, A))
+            directions.sort(key=lambda z: len(z[1]))
+
+            plans = []
+            for anchor, moving in directions:
+                for p in _ripple_contact_plans(sol, anchor, moving,
+                                               delta, pair_cap):
+                    plans.append((p, anchor, moving))
+            plans.sort(key=lambda z: abs(z[0][0][0]) + abs(z[0][0][1]))
+
+            for plan, anchor, moving in plans:
+                if stats['trials'] >= trial_cap or time.perf_counter() >= deadline:
+                    break
+                motion, contact_axis, leader, follower, _f, _m = plan
+                if np.max(np.abs(motion)) > drag_cap:
+                    continue
+                stats['trials'] += 1
+
+                hc, vc = _swap_contact_edge(H, V, leader, follower,
+                                            contact_axis, leader, follower)
+                ordx = _topological_order(n, hc)
+                ordy = _topological_order(n, vc)
+                if ordx is None or ordy is None:
+                    continue
+
+                cand = sol.copy()
+                midx = np.asarray(moving, dtype=np.int64)
+                cand[midx, :2] += motion
+                fixed = pre_mask.copy()
+                fixed[np.asarray(anchor, dtype=np.int64)] = True
+                fixed[midx] = True
+
+                # Pin the two existing touching components and minimally
+                # reassign everything else.  This is the ripple propagation.
+                for axis, edges, order in ((0, hc, ordx), (1, vc, ordy)):
+                    target = sol[:, axis].copy()
+                    fixed_pos = cand[:, axis].copy()
+                    cand[:, axis] = assign_axis(
+                        n, edges, target, cand[:, 2 + axis], fixed, fixed_pos,
+                        order, wall_hi=walls[axis][1], wall_lo=walls[axis][0])
+
+                if not _graph_is_legal(cand, hc, 0) \
+                        or not _graph_is_legal(cand, vc, 1):
+                    continue
+                if any(cand[:, a].min() < walls[a][0] - 1e-7 or
+                       (cand[:, a] + cand[:, 2 + a]).max()
+                       > walls[a][1] + 1e-7 for a in (0, 1)):
+                    continue
+                intended = sol.copy()
+                intended[midx, :2] += motion
+                pinned = np.nonzero(fixed)[0]
+                if np.max(np.abs(cand[pinned, :2] - intended[pinned, :2])) > 1e-7:
+                    continue
+                if max_penetration(cand) > _EPS_OVL:
+                    continue
+                moved = np.nonzero(np.max(np.abs(cand[:, :2] - sol[:, :2]),
+                                          axis=1) > 1e-8)[0]
+                total_disp = float(np.abs(cand[:, :2] - sol[:, :2]).sum())
+                if len(moved) > block_cap or total_disp > disp_cap:
+                    continue
+                _vb, vg, _vm = _violations_official(cand, cons)
+                if vg >= base_vg:
+                    continue
+                cost = proxy_cost(cand, case, hpwl_base, area_base, n_soft)
+                if cost >= base_cost - 1e-12:
+                    continue
+
+                sol = cand
+                H, V = hc, vc
+                base_cost, base_vg = cost, vg
+                stats['moves'] += 1
+                stats['moved_blocks'] += len(moved)
+                stats['group_after'] = vg
+                improved = True
+                break
+            if improved:
+                break
+
+    stats['runtime_s'] = time.perf_counter() - t0
+    return sol, stats
+
+
 # ------------------------------------------------------------------ driver
 
 def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
@@ -1418,7 +1652,7 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         return sol, H, V, adjH, adjV
 
     def finish(rr):
-        """Snap a legal_round result and score it. Returns (cost, sol)."""
+        """Snap a legal_round result; return cost, solution, and its graphs."""
         s, _H, _V, aH, aV = rr
         s = snap_soft(s.copy(), case, aH, aV, pre_mask, cfg, S, alpha,
                       n_soft, nbr_i)
@@ -1427,18 +1661,20 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         if cfg.get('perp_align', True):
             s = cluster_perp_align(s, case, aH, aV, pre_mask, cfg, S,
                                    hpwl_base, area_base, n_soft)
-        return proxy_cost(s, case, hpwl_base, area_base, n_soft), s
+        return (proxy_cost(s, case, hpwl_base, area_base, n_soft), s,
+                _H, _V)
 
     # G: short local overlap cleanup, then two graph rounds (the second
     # rebuilds the graph from legal geometry -> cleaner axis choices)
     geo = gradient_phase(pred, case, pre_mask, cfg, S, hpwl_base, area_base,
                          iters=g_iters)
     r1 = legal_round(geo, cfg['polish_sweeps'])
-    cost, sol = finish(r1)
+    cost, sol, H, V = finish(r1)
     if max_penetration(r1[0]) <= _EPS_OVL:
-        c2, s2 = finish(legal_round(r1[0].copy(), cfg['polish_sweeps']))
+        c2, s2, h2, v2 = finish(
+            legal_round(r1[0].copy(), cfg['polish_sweeps']))
         if c2 < cost:
-            cost, sol = c2, s2
+            cost, sol, H, V = c2, s2, h2, v2
 
     # anchored boundary bits still violated -> retry with the extents driven
     # into the anchors' span (aggressive rung, pays only where needed)
@@ -1447,24 +1683,36 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         anchored = any(pre_mask[i] and bits[i]
                        for i in np.nonzero(bits)[0])
         if vb >= 2 and anchored:
-            c3, s3 = finish(legal_round(geo, cfg['polish_sweeps'],
-                                        span=True))
+            c3, s3, h3, v3 = finish(
+                legal_round(geo, cfg['polish_sweeps'], span=True))
             if c3 < cost:
-                cost, sol = c3, s3
+                cost, sol, H, V = c3, s3, h3, v3
+
+    # stage DP-2: close cheap-but-blocked group gaps by locally reassigning
+    # predecessor/successor chains inside the existing bbox.
+    ripple_info = {'trials': 0, 'moves': 0, 'moved_blocks': 0,
+                   'group_before': 0, 'group_after': 0, 'runtime_s': 0.0}
+    if cost < 9 and cfg.get('ripple_repair', True):
+        sol, ripple_info = cluster_ripple_repair(
+            sol, case, H, V, pre_mask, cfg, S, hpwl_base, area_base, n_soft)
+        cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
 
     # stage DP: cluster-grouping repair (2D component merges, proxy-guarded)
     if cost < 9:
         sol = cluster_repair(sol, case, pre_mask, cfg, S, hpwl_base,
                              area_base, n_soft)
         cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+    ripple_info['group_final'] = _violations_official(sol, cons)[1]
 
     pen = max_penetration(sol)
     info = {'proxy_cost': cost, 'penetration': pen,
             'move_mean': float(np.abs(sol[:, :2] - pred[:, :2]).mean() / S),
-            'runtime_s': time.time() - t0}
+            'runtime_s': time.time() - t0, 'ripple': ripple_info}
     if verbose:
         print(f"  proxy={cost:.4f} pen={pen:.2e} "
-              f"move={info['move_mean']:.4f} t={info['runtime_s']:.2f}s")
+              f"move={info['move_mean']:.4f} "
+              f"ripple={ripple_info['moves']}/{ripple_info['trials']} "
+              f"t={info['runtime_s']:.2f}s")
     return torch.tensor(sol, dtype=torch.float64), info
 
 
