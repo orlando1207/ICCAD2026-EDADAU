@@ -44,7 +44,7 @@ from .evaluate import bbox_area as _bbox_area
 from .evaluate import weighted_hpwl as _whpwl
 
 DEFAULT_CFG = {
-    'g_iters': 80,           # gradient-phase iteration cap (local cleanup)
+    'g_iters': 100,          # gradient-phase iteration cap (local cleanup)
     'g_tol_rel': 1e-4,       # G stops when max penetration < this x S
     'attach_tol_rel': 0.05,  # boundary spring engages within this x S
     'delta_rel': 1e-3,       # min shared-edge length for cluster abutment, x S
