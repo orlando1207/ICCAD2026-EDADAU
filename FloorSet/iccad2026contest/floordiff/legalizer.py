@@ -67,13 +67,13 @@ DEFAULT_CFG = {
     # is a pair-edge swap plus two O(n^2) DAG assignments; strict caps keep this
     # stage small relative to diffusion sampling and the two legal rounds.
     'ripple_repair': True,
-    'ripple_close_rel': 0.025,
-    'ripple_drag_rel': 0.04,
-    'ripple_budget_s': 0.03,
-    'ripple_trials': 24,
+    'ripple_close_rel': 0.06,
+    'ripple_drag_rel': 0.08,
+    'ripple_budget_s': 0.04,
+    'ripple_trials': 32,
     'ripple_moves': 4,
-    'ripple_pair_choices': 2,
-    'ripple_max_blocks': 20,
+    'ripple_pair_choices': 3,
+    'ripple_max_blocks': 24,
     'ripple_total_disp_rel': 0.30,
     # Shape-aware detailed placement.  Residual group gaps are closed by
     # elongating one soft block toward contact (area exact); small bbox sides
@@ -1478,6 +1478,7 @@ def cluster_ripple_repair(sol, case, H, V, pre_mask, cfg, S,
     """
     t0 = time.perf_counter()
     stats = {'trials': 0, 'moves': 0, 'moved_blocks': 0,
+             'overlap_proposals': 0, 'projected_trials': 0,
              'group_before': 0, 'group_after': 0, 'runtime_s': 0.0}
     cons = case['cons'].numpy()
     groups = [np.nonzero(cons[:, 3] == g)[0]
@@ -1556,12 +1557,15 @@ def cluster_ripple_repair(sol, case, H, V, pre_mask, cfg, S,
                 cand = sol.copy()
                 midx = np.asarray(moving, dtype=np.int64)
                 cand[midx, :2] += motion
+                stats['overlap_proposals'] += int(
+                    max_penetration(cand) > _EPS_OVL)
                 fixed = pre_mask.copy()
                 fixed[np.asarray(anchor, dtype=np.int64)] = True
                 fixed[midx] = True
 
                 # Pin the two existing touching components and minimally
                 # reassign everything else.  This is the ripple propagation.
+                stats['projected_trials'] += 1
                 for axis, edges, order in ((0, hc, ordx), (1, vc, ordy)):
                     target = sol[:, axis].copy()
                     fixed_pos = cand[:, axis].copy()
@@ -2160,19 +2164,29 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
             if c3 < cost:
                 cost, sol, H, V, graph_info = c3, s3, h3, v3, g3
 
-    # stage DP-2: close cheap-but-blocked group gaps by locally reassigning
-    # predecessor/successor chains inside the existing bbox.
+    # Stage DP-1: take cheap rigid component contacts first. These moves stay
+    # legal, so they remove easy targets without spending projection trials.
     ripple_info = {'trials': 0, 'moves': 0, 'moved_blocks': 0,
-                   'group_before': 0, 'group_after': 0, 'runtime_s': 0.0}
-    if cost < 9 and cfg.get('ripple_repair', True):
-        sol, ripple_info = cluster_ripple_repair(
-            sol, case, H, V, pre_mask, cfg, S, hpwl_base, area_base, n_soft)
-        cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
-
-    # stage DP: cluster-grouping repair (2D component merges, proxy-guarded)
+                   'overlap_proposals': 0, 'projected_trials': 0,
+                   'group_before': 0, 'group_after': 0, 'runtime_s': 0.0,
+                   'fresh_graph': False}
     if cost < 9:
         sol = cluster_repair(sol, case, pre_mask, cfg, S, hpwl_base,
                              area_base, n_soft)
+        cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+
+    # Stage DP-2: residual rigid contacts are usually blocked. Allow the desired
+    # component translation to overlap transiently, then project it through a
+    # freshly rebuilt all-pair separation graph. Only the legal, proxy-improving
+    # projected result can commit; the entry solution remains the incumbent.
+    if cost < 9 and cfg.get('ripple_repair', True):
+        keyx = sol[:, 0] + 0.5 * sol[:, 2]
+        keyy = sol[:, 1] + 0.5 * sol[:, 3]
+        proj_H, proj_V = build_graph(sol, keyx, keyy)
+        sol, ripple_info = cluster_ripple_repair(
+            sol, case, proj_H, proj_V, pre_mask, cfg, S, hpwl_base,
+            area_base, n_soft)
+        ripple_info['fresh_graph'] = True
         cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
 
     # stage DP-3: target only violations left by every position-only repair.

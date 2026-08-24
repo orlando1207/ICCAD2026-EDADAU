@@ -25,10 +25,16 @@ class ClusterRippleRepairTest(unittest.TestCase):
             [2.0, 3.0, 2.0, 0.2],
         ])
         cons = torch.zeros((3, 5), dtype=torch.long)
+        cons[0, 1] = 1
         cons[0, 3] = 1
         cons[1, 3] = 1
         self.case = {
             'cons': cons,
+            'area': torch.tensor([6.0, 4.0, 0.4]),
+            'target': torch.tensor([[0.0, 0.0, 2.0, 3.0],
+                                    [-1.0, -1.0, -1.0, -1.0],
+                                    [-1.0, -1.0, -1.0, -1.0]]),
+            'gt': None,
             'b2b': torch.zeros((0, 3)),
             'p2b': torch.zeros((0, 3)),
             'pins': torch.zeros((0, 2)),
@@ -64,8 +70,11 @@ class ClusterRippleRepairTest(unittest.TestCase):
         self.assertEqual(stats['group_before'], 1)
         self.assertEqual(stats['group_after'], 0)
         self.assertEqual(stats['moves'], 1)
+        self.assertGreaterEqual(stats['overlap_proposals'], 1)
+        self.assertGreaterEqual(stats['projected_trials'], 1)
         self.assertLess(out[2, 1], self.sol[2, 1])
         self.assertLessEqual(lg.max_penetration(out), lg._EPS_OVL)
+        self.assertTrue(lg.hard_feasibility(out, self.case)['feasible'])
         self.assertEqual(lg._violations_official(
             out, self.case['cons'].numpy())[1], 0)
         after_bbox = [
