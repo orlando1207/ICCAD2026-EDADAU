@@ -60,16 +60,16 @@ def init_worker():
 
 
 def legalize_one(args):
-    """(pred_xywh, case, cfg) -> (sol, proxy_cost). Never raises: a worker that
-    dies must not take the whole case down, so failures come back as +inf and
-    lose the min()."""
+    """(pred_xywh, case, cfg) -> (sol, info). Never raises: a worker that
+    dies must not take the whole case down, so failures return no candidate and
+    are excluded from selection."""
     pred, case, cfg = args
     try:
         from floordiff.legalizer import legalize_case
         sol, info = legalize_case(pred, case, cfg)
-        return sol, float(info['proxy_cost'])
+        return sol, info
     except Exception:
-        return None, float('inf')
+        return None, None
 
 
 def resolve_workers(requested=None):
@@ -121,7 +121,7 @@ def legalize_parallel(pool, cands, case, cfg, deadline_s=None):
                     try:
                         results[k] = ar.get(timeout=0)
                     except Exception:
-                        results[k] = (None, float('inf'))
+                        results[k] = (None, None)
                     done.append(k)
             if len(done) == len(tasks) or time.time() - t0 > deadline_s:
                 break
@@ -133,10 +133,18 @@ def legalize_parallel(pool, cands, case, cfg, deadline_s=None):
                 done.append(0)
             except Exception:
                 pass
-        results = [r if r is not None else (None, float('inf')) for r in results]
+        results = [r if r is not None else (None, None) for r in results]
 
-    best_k, (sol, cost) = min(
-        ((k, r) for k, r in enumerate(results)), key=lambda kr: (kr[1][1], kr[0]))
-    info = {'proxy_cost': cost, 'seed_rank': best_k, 'n_done': len(done),
-            'n_cands': len(cands), 'runtime_s': time.time() - t0}
+    valid = [(k, r) for k, r in enumerate(results)
+             if r[0] is not None and r[1] is not None]
+    if not valid:
+        return None, {'proxy_cost': float('inf'), 'seed_rank': None,
+                      'n_done': len(done), 'n_cands': len(cands),
+                      'runtime_s': time.time() - t0}
+    from floordiff.legalizer import _selection_key
+    best_k, (sol, worker_info) = min(
+        valid, key=lambda kr: _selection_key(kr[1][1], kr[0]))
+    info = dict(worker_info)
+    info.update({'seed_rank': best_k, 'n_done': len(done),
+                 'n_cands': len(cands), 'runtime_s': time.time() - t0})
     return sol, info

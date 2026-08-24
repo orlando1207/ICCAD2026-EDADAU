@@ -1,7 +1,7 @@
 """EGL: ePlace-Gradient + Graph legalizer (stage 2).
 
 Implements docs/superpowers/specs/2026-07-20-egl-legalizer-design.md:
-  stamp  hard constraints (preplaced pos+dims, fixed dims, MIB dims tied)
+  stamp  hard constraints (preplaced pos+dims, fixed dims, compatible MIB dims)
   G      ePlace-lite gradient phase: weighted HPWL + pairwise overlap field +
          bbox / boundary / cluster springs + anchor, Nesterov with Lipschitz
          step prediction and Jacobi preconditioning (ePlace Alg. 2, Eqs 29-33)
@@ -94,6 +94,9 @@ DEFAULT_CFG = {
 }
 
 _EPS_OVL = 1e-6              # official: pair violates only if BOTH axes > 1e-6
+_EPS_DIM = 1e-4              # official immutable-coordinate tolerance
+_AREA_TOL = 0.01             # official relative soft-block area tolerance
+_AREA_SAFE_TOL = _AREA_TOL - 1e-9  # stay off floating-point acceptance edge
 
 
 # ------------------------------------------------------------------ metrics
@@ -106,6 +109,166 @@ def max_penetration(xywh):
     both = np.minimum(ox, oy)
     np.fill_diagonal(both, -1.0)
     return max(0.0, float(both.max()))
+
+
+def hard_feasibility(sol, case):
+    """Return official hard-constraint status plus useful diagnostics.
+
+    Missing area/target data is skipped so focused geometry helpers can use this
+    validator too. Numeric/positive-size checks guard malformed model output.
+    """
+    xywh = np.asarray(sol, dtype=np.float64)
+    n = len(xywh)
+    cons_t = case.get('cons')
+    cons = (cons_t.detach().cpu().numpy() if torch.is_tensor(cons_t)
+            else np.asarray(cons_t)) if cons_t is not None else np.zeros((n, 2))
+    fixed = cons[:n, 0] != 0 if cons.shape[1] > 0 else np.zeros(n, dtype=bool)
+    pre = cons[:n, 1] != 0 if cons.shape[1] > 1 else np.zeros(n, dtype=bool)
+
+    finite_rows = np.isfinite(xywh).all(axis=1)
+    positive = (xywh[:, 2] > 0) & (xywh[:, 3] > 0)
+    numeric_bad = np.nonzero(~finite_rows | ~positive)[0]
+
+    # Match check_overlap(): both intersections must be strictly above 1e-6.
+    safe = xywh.copy()
+    safe[~finite_rows] = 0.0
+    x0, y0, w, h = safe.T
+    x1, y1 = x0 + w, y0 + h
+    ox = np.minimum(x1[:, None], x1) - np.maximum(x0[:, None], x0)
+    oy = np.minimum(y1[:, None], y1) - np.maximum(y0[:, None], y0)
+    overlap_mask = np.triu((ox > _EPS_OVL) & (oy > _EPS_OVL), k=1)
+    overlap_pairs = np.argwhere(overlap_mask)
+    pair_pen = np.minimum(ox, oy)[overlap_mask]
+
+    area_bad = np.empty(0, dtype=np.int64)
+    max_area_error = 0.0
+    area_t = case.get('area')
+    if area_t is not None:
+        target_area = (area_t.detach().cpu().numpy() if torch.is_tensor(area_t)
+                       else np.asarray(area_t)).astype(np.float64)[:n]
+        check = (~fixed) & (~pre) & (target_area > 0) & finite_rows
+        rel = np.zeros(n, dtype=np.float64)
+        rel[check] = np.abs(xywh[check, 2] * xywh[check, 3]
+                            - target_area[check]) / target_area[check]
+        area_bad = np.nonzero(check & (rel > _AREA_TOL))[0]
+        if check.any():
+            max_area_error = float(rel[check].max())
+
+    dim_bad = np.empty(0, dtype=np.int64)
+    max_dimension_error = 0.0
+    target = None
+    if case.get('gt') is not None:
+        target = target_xywh(case).detach().cpu().numpy()
+    elif case.get('target') is not None:
+        target_t = case['target']
+        target = (target_t.detach().cpu().numpy() if torch.is_tensor(target_t)
+                  else np.asarray(target_t))
+    if target is not None:
+        target = np.asarray(target, dtype=np.float64)[:n]
+        immutable = fixed | pre
+        err = np.zeros(n, dtype=np.float64)
+        if immutable.any():
+            err[fixed] = np.max(np.abs(xywh[fixed, 2:4]
+                                       - target[fixed, 2:4]), axis=1)
+            err[pre] = np.max(np.abs(xywh[pre] - target[pre]), axis=1)
+            dim_bad = np.nonzero(immutable & (err > _EPS_DIM))[0]
+            max_dimension_error = float(err[immutable].max())
+
+    total = (len(overlap_pairs) + len(area_bad) + len(dim_bad)
+             + len(numeric_bad))
+    return {
+        'feasible': total == 0,
+        'total_violations': int(total),
+        'overlap_violations': int(len(overlap_pairs)),
+        'area_violations': int(len(area_bad)),
+        'dimension_violations': int(len(dim_bad)),
+        'numeric_violations': int(len(numeric_bad)),
+        'overlap_pairs': overlap_pairs.tolist(),
+        'area_blocks': area_bad.tolist(),
+        'dimension_blocks': dim_bad.tolist(),
+        'numeric_blocks': numeric_bad.tolist(),
+        'max_penetration': float(pair_pen.max()) if len(pair_pen) else 0.0,
+        'max_area_error': max_area_error,
+        'max_dimension_error': max_dimension_error,
+    }
+
+
+def _selection_key(info, seed_rank=0):
+    """Feasible candidates always beat infeasible candidates, deterministically."""
+    hard = info['hard']
+    if hard['feasible']:
+        return (0, float(info['proxy_cost']), int(seed_rank))
+    return (1, int(hard['total_violations']),
+            int(hard['overlap_violations']), int(hard['area_violations']),
+            int(hard['dimension_violations']), int(hard['numeric_violations']),
+            float(info['proxy_cost']), int(seed_rank))
+
+
+def _tie_compatible_mib_dims(pred, case, fixed_mask, pre_mask):
+    """Tie MIB shapes only when equality is compatible with every hard rule.
+
+    MIB equality is soft. An incompatible group is left untied: frozen members
+    remain exact and each ordinary member retains its legal area.
+    """
+    cons_t = case['cons']
+    cons = (cons_t.detach().cpu().numpy() if torch.is_tensor(cons_t)
+            else np.asarray(cons_t))
+    area_t = case['area']
+    target_area = (area_t.detach().cpu().numpy() if torch.is_tensor(area_t)
+                   else np.asarray(area_t)).astype(np.float64)
+    stats = {'groups': 0, 'tied': 0, 'incompatible': 0,
+             'incompatible_frozen': 0, 'incompatible_area': 0}
+
+    for g in np.unique(cons[:, 2]):
+        if g == 0:
+            continue
+        stats['groups'] += 1
+        mem = np.nonzero(cons[:, 2] == g)[0]
+        frozen = mem[fixed_mask[mem] | pre_mask[mem]]
+        soft = mem[~(fixed_mask[mem] | pre_mask[mem])]
+
+        if len(frozen):
+            # Frozen shapes are restored exactly; rounded equality is the MIB
+            # evaluator's own comparison and requires no immutable rewrite.
+            rounded = {(round(float(pred[i, 2]), 4),
+                        round(float(pred[i, 3]), 4)) for i in frozen}
+            if len(rounded) != 1:
+                stats['incompatible'] += 1
+                stats['incompatible_frozen'] += 1
+                continue
+            rep = int(frozen[0])
+            common_area = float(pred[rep, 2] * pred[rep, 3])
+            if any(abs(common_area - target_area[i]) / target_area[i]
+                   > _AREA_SAFE_TOL for i in soft if target_area[i] > 0):
+                stats['incompatible'] += 1
+                stats['incompatible_area'] += 1
+                continue
+            pred[soft, 2:4] = pred[rep, 2:4]
+            stats['tied'] += 1
+            continue
+
+        # All-soft groups admit a common legal shape iff their 1% target-area
+        # intervals intersect. Preserve the representative when already legal.
+        if not (target_area[mem] > 0).all():
+            stats['incompatible'] += 1
+            stats['incompatible_area'] += 1
+            continue
+        lo = float(np.max((1.0 - _AREA_SAFE_TOL) * target_area[mem]))
+        hi = float(np.min((1.0 + _AREA_SAFE_TOL) * target_area[mem]))
+        if lo > hi:
+            stats['incompatible'] += 1
+            stats['incompatible_area'] += 1
+            continue
+        rep = int(mem[0])
+        rep_area = float(pred[rep, 2] * pred[rep, 3])
+        common_area = min(max(rep_area, lo), hi)
+        ratio = max(float(pred[rep, 2] / pred[rep, 3]), 1e-12)
+        common_w = math.sqrt(common_area * ratio)
+        common_h = common_area / common_w
+        pred[mem, 2] = common_w
+        pred[mem, 3] = common_h
+        stats['tied'] += 1
+    return stats
 
 
 def _violations_official(sol, cons):
@@ -155,8 +318,8 @@ def _n_soft_norm(cons):
 
 
 def proxy_cost(sol_np, case, hpwl_base, area_base, n_soft):
-    """Official cost formula (RuntimeFactor neutral); 10.0 if overlapping."""
-    if max_penetration(sol_np) > _EPS_OVL:
+    """Official cost formula (RuntimeFactor neutral); 10.0 if hard-invalid."""
+    if not hard_feasibility(sol_np, case)['feasible']:
         return 10.0
     t = torch.tensor(sol_np, dtype=torch.float64)
     hg = (_whpwl(t, case) - hpwl_base) / max(hpwl_base, 1e-6)
@@ -1760,15 +1923,7 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
     if asc < 1.0:
         soft = (~pre_mask) & (~fixed_mask)
         pred[soft, 2:4] *= math.sqrt(asc)
-    # MIB: tie dims to the group representative (fixed/preplaced member wins)
-    for g in np.unique(cons[:, 2]):
-        if g == 0:
-            continue
-        mem = np.nonzero(cons[:, 2] == g)[0]
-        frozen = [i for i in mem if fixed_mask[i] or pre_mask[i]]
-        rep = frozen[0] if frozen else int(mem[0])
-        pred[mem, 2] = pred[rep, 2]
-        pred[mem, 3] = pred[rep, 3]
+    mib_info = _tie_compatible_mib_dims(pred, case, fixed_mask, pre_mask)
     shrinkable = (~pre_mask) & (~fixed_mask) & (cons[:, 2] == 0)
     areas = pred[:, 2] * pred[:, 3]
     clu_groups = [np.nonzero(cons[:, 3] == g)[0]
@@ -1810,10 +1965,13 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
                 pre_hi_req[axis] = max(hi)
         org = [w if w is not None else -np.inf for w in wall_lo]
 
+        graph_info = {'repair_failures': 0, 'assign_failures': 0,
+                      'final_assignment_ok': False}
         H, V = build_graph(geo, keyx, keyy)
-        H, V, wd, hd, _ok = repair_graph(H, V, geo, keyx, keyy, pre_mask,
-                                         shrinkable, areas,
-                                         origin_x=org[0], origin_y=org[1])
+        H, V, wd, hd, ok = repair_graph(H, V, geo, keyx, keyy, pre_mask,
+                                       shrinkable, areas,
+                                       origin_x=org[0], origin_y=org[1])
+        graph_info['repair_failures'] += int(not ok)
         ordx = np.lexsort((np.arange(n), keyx)).tolist()
         ordy = np.lexsort((np.arange(n), keyy)).tolist()
         sol = np.empty((n, 4))
@@ -1833,9 +1991,10 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         H, V = extent_repair(n, H, V, sol, pre_mask, shrinkable, areas, gt,
                              tgt_rep, keyx, keyy, ordx, ordy)
         geo2 = np.stack([geo[:, 0], geo[:, 1], sol[:, 2], sol[:, 3]], 1)
-        H, V, wd, hd, _ok = repair_graph(H, V, geo2, keyx, keyy, pre_mask,
-                                         shrinkable, areas,
-                                         origin_x=org[0], origin_y=org[1])
+        H, V, wd, hd, ok = repair_graph(H, V, geo2, keyx, keyy, pre_mask,
+                                       shrinkable, areas,
+                                       origin_x=org[0], origin_y=org[1])
+        graph_info['repair_failures'] += int(not ok)
         sol[:, 2], sol[:, 3] = wd, hd
 
         def contact_intents():
@@ -1939,26 +2098,34 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
                 if cfg.get('cluster_align', True) else (None, None)
             assign(0, H, ordx, use_wall, pin, ints[0], al[0])
             assign(1, V, ordy, use_wall, pin, ints[1], al[1])
-            return max_penetration(sol) <= _EPS_OVL
+            ok = max_penetration(sol) <= _EPS_OVL
+            graph_info['assign_failures'] += int(not ok)
+            return ok
 
         # ladder: pinned walls -> unpinned walls -> wall-free repair +
         # unpinned walls -> no walls at all
-        if not do_assign(True, True) and not do_assign(True, False):
+        assigned = do_assign(True, True)
+        if not assigned:
+            assigned = do_assign(True, False)
+        if not assigned:
             geo3 = np.stack([geo[:, 0], geo[:, 1], sol[:, 2], sol[:, 3]], 1)
-            H2, V2, wd2, hd2, _ = repair_graph(
+            H2, V2, wd2, hd2, ok = repair_graph(
                 H, V, geo3, keyx, keyy, pre_mask, shrinkable, areas)
+            graph_info['repair_failures'] += int(not ok)
             H[:], V[:] = H2, V2
             sol[:, 2], sol[:, 3] = wd2, hd2
-            if not do_assign(True, False):
-                do_assign(False, False)
+            assigned = do_assign(True, False)
+            if not assigned:
+                assigned = do_assign(False, False)
+        graph_info['final_assignment_ok'] = bool(assigned)
         adjH = _adj_arrays(n, H)
         adjV = _adj_arrays(n, V)
         sol[:] = polish(sol, case, adjH, adjV, pre_mask, sweeps, nbr_i)
-        return sol, H, V, adjH, adjV
+        return sol, H, V, adjH, adjV, graph_info
 
     def finish(rr):
         """Snap a legal_round result; return cost, solution, and its graphs."""
-        s, _H, _V, aH, aV = rr
+        s, _H, _V, aH, aV, graph_info = rr
         s = snap_soft(s.copy(), case, aH, aV, pre_mask, cfg, S, alpha,
                       n_soft, nbr_i)
         # give still-split cluster groups a real shared edge, using graph slack
@@ -1967,19 +2134,19 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
             s = cluster_perp_align(s, case, aH, aV, pre_mask, cfg, S,
                                    hpwl_base, area_base, n_soft)
         return (proxy_cost(s, case, hpwl_base, area_base, n_soft), s,
-                _H, _V)
+                _H, _V, graph_info)
 
     # G: short local overlap cleanup, then two graph rounds (the second
     # rebuilds the graph from legal geometry -> cleaner axis choices)
     geo = gradient_phase(pred, case, pre_mask, cfg, S, hpwl_base, area_base,
                          iters=g_iters)
     r1 = legal_round(geo, cfg['polish_sweeps'])
-    cost, sol, H, V = finish(r1)
+    cost, sol, H, V, graph_info = finish(r1)
     if max_penetration(r1[0]) <= _EPS_OVL:
-        c2, s2, h2, v2 = finish(
+        c2, s2, h2, v2, g2 = finish(
             legal_round(r1[0].copy(), cfg['polish_sweeps']))
         if c2 < cost:
-            cost, sol, H, V = c2, s2, h2, v2
+            cost, sol, H, V, graph_info = c2, s2, h2, v2, g2
 
     # anchored boundary bits still violated -> retry with the extents driven
     # into the anchors' span (aggressive rung, pays only where needed)
@@ -1988,10 +2155,10 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         anchored = any(pre_mask[i] and bits[i]
                        for i in np.nonzero(bits)[0])
         if vb >= 2 and anchored:
-            c3, s3, h3, v3 = finish(
+            c3, s3, h3, v3, g3 = finish(
                 legal_round(geo, cfg['polish_sweeps'], span=True))
             if c3 < cost:
-                cost, sol, H, V = c3, s3, h3, v3
+                cost, sol, H, V, graph_info = c3, s3, h3, v3, g3
 
     # stage DP-2: close cheap-but-blocked group gaps by locally reassigning
     # predecessor/successor chains inside the existing bbox.
@@ -2021,13 +2188,20 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
     ripple_info['group_final'] = _violations_official(sol, cons)[1]
 
-    pen = max_penetration(sol)
-    info = {'proxy_cost': cost, 'penetration': pen,
+    # Detailed placement must not perturb immutable fields. Re-stamp them before
+    # the authoritative hard gate; any overlap exposed by this restoration makes
+    # the candidate infeasible rather than silently moving an immutable block.
+    sol[pre_mask] = gt[pre_mask]
+    sol[fixed_mask, 2:4] = gt[fixed_mask, 2:4]
+    hard = hard_feasibility(sol, case)
+    cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+    pen = hard['max_penetration']
+    info = {'proxy_cost': cost, 'penetration': pen, 'hard': hard,
             'move_mean': float(np.abs(sol[:, :2] - pred[:, :2]).mean() / S),
             'runtime_s': time.time() - t0, 'ripple': ripple_info,
-            'reshape': reshape_info}
+            'reshape': reshape_info, 'mib': mib_info, 'graph': graph_info}
     if verbose:
-        print(f"  proxy={cost:.4f} pen={pen:.2e} "
+        print(f"  proxy={cost:.4f} hard={hard['feasible']} pen={pen:.2e} "
               f"move={info['move_mean']:.4f} "
               f"ripple={ripple_info['moves']}/{ripple_info['trials']} "
               f"reshape={reshape_info['moves']}/{reshape_info['trials']} "
@@ -2044,9 +2218,11 @@ def legalize_best_of(cand_list, case, cfg=None, verbose=False):
     for k, pred in enumerate(cand_list):
         sol, info = legalize_case(pred, case, cfg, verbose=verbose)
         info['seed_rank'] = k
-        if best is None or info['proxy_cost'] < best[1]['proxy_cost']:
+        if (best is None
+                or _selection_key(info, k)
+                < _selection_key(best[1], best[1]['seed_rank'])):
             best = (sol, info)
-        if info['proxy_cost'] < cfg['seed_stop']:
+        if info['hard']['feasible'] and info['proxy_cost'] < cfg['seed_stop']:
             break
         if time.time() - t0 > cfg['budget_s']:
             break
