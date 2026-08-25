@@ -41,7 +41,9 @@ sys.path.insert(0, str(_HERE))
 
 from iccad2026_evaluate import FloorplanOptimizer          # noqa: E402
 from floordiff.data import featurize, decode               # noqa: E402
-from floordiff.legalizer import DEFAULT_CFG, legalize_best_of   # noqa: E402
+from floordiff.legalizer import (DEFAULT_CFG, legalize_best_of,   # noqa: E402
+                                 guaranteed_construction,
+                                 hard_feasibility)
 from floordiff.parallel import (legalize_parallel, make_pool,   # noqa: E402
                                 resolve_workers)
 from floordiff.sample import load_checkpoint, rank_cost    # noqa: E402
@@ -131,8 +133,24 @@ class MyOptimizer(FloorplanOptimizer):
 
     def solve(self, block_count, area_targets, b2b_connectivity,
               p2b_connectivity, pins_pos, constraints, target_positions=None):
+        """Never returns an infeasible placement: `legalize_case` carries its
+        own hard gate plus a shelf-construction floor, and anything that escapes
+        that (an exception anywhere in sampling or legalization) is caught here
+        and answered with the same construction."""
+        try:
+            return self._solve(block_count, area_targets, b2b_connectivity,
+                               p2b_connectivity, pins_pos, constraints,
+                               target_positions)
+        except Exception as exc:                       # never fail a case
+            print(f'[floordiff] solve failed ({exc!r}); using construction')
+            return self._rescue(block_count, area_targets, b2b_connectivity,
+                                p2b_connectivity, pins_pos, constraints,
+                                target_positions)
+
+    def _case(self, block_count, area_targets, b2b_connectivity,
+              p2b_connectivity, pins_pos, constraints, target_positions):
         n = int(block_count)
-        case = {
+        return {
             'area': area_targets[:n].float(),
             'cons': constraints[:n].long(),
             'b2b': _clean(b2b_connectivity).float()
@@ -146,6 +164,27 @@ class MyOptimizer(FloorplanOptimizer):
             'target': target_positions[:n].double()
                       if target_positions is not None else torch.zeros(n, 4),
         }
+
+    def _rescue(self, block_count, area_targets, b2b_connectivity,
+                p2b_connectivity, pins_pos, constraints, target_positions):
+        """Model-free, search-free, guaranteed-feasible answer of last resort."""
+        n = int(block_count)
+        case = self._case(block_count, area_targets, b2b_connectivity,
+                          p2b_connectivity, pins_pos, constraints,
+                          target_positions)
+        import numpy as np
+        area = case['area'].numpy().astype('float64')
+        side = np.sqrt(area)
+        pred = np.stack([np.zeros(n), np.zeros(n), side, side], axis=1)
+        sol = guaranteed_construction(pred, case, self.cfg)
+        return [tuple(map(float, row)) for row in sol]
+
+    def _solve(self, block_count, area_targets, b2b_connectivity,
+               p2b_connectivity, pins_pos, constraints, target_positions=None):
+        n = int(block_count)
+        case = self._case(block_count, area_targets, b2b_connectivity,
+                          p2b_connectivity, pins_pos, constraints,
+                          target_positions)
 
         # ---- sample N seeds as one batch, keep top-k by quick proxy
         tensors, meta = featurize(case)
@@ -172,6 +211,12 @@ class MyOptimizer(FloorplanOptimizer):
                                           deadline_s=self.deadline)
             if sol is None:                     # every worker failed: rescue
                 sol, info = legalize_best_of(top[:2], case, self.cfg)
+        if sol is None or not hard_feasibility(sol.numpy(), case)['feasible']:
+            # legalize_case has its own floor, so this is unreachable in
+            # principle; keep it anyway -- an infeasible return costs 10.0.
+            print('[floordiff] no feasible candidate; using construction')
+            return [tuple(map(float, row)) for row in
+                    guaranteed_construction(top[0].numpy(), case, self.cfg)]
         if self.verbose:
             print(f"  n={n} proxy={info['proxy_cost']:.4f} "
                   f"seed={info.get('seed_rank')} "

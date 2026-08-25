@@ -91,6 +91,16 @@ DEFAULT_CFG = {
     'reshape_aspect_cap': 3.6,
     'reshape_max_blocks': 48,
     'reshape_total_disp_rel': 0.20,
+    # Feasibility completeness (see FEASIBILITY_ANALYSIS.md 4-5).
+    'evict_repair': True,    # stage E: evict blocks off anchor-conflicting
+                             # critical paths until the relation set is
+                             # consistent -> assignment cannot overlap
+    'evict_max': 64,         # eviction budget per legal_round
+    'reclaim': True,         # pull evicted blocks back into free holes
+    'reclaim_trials': 24,    # max blocks reclaimed per call
+    'reclaim_probe': 8,      # free positions scored with the real proxy per block
+    'reclaim_budget_s': 0.05,
+    'guaranteed_floor': True,   # never return an infeasible solution
 }
 
 _EPS_OVL = 1e-6              # official: pair violates only if BOTH axes > 1e-6
@@ -1901,6 +1911,256 @@ def shape_detail_repair(sol, case, pre_mask, shrinkable, cfg, S,
     return sol, stats
 
 
+# ------------------------------------------------------- stage E: eviction
+
+def _eviction_score(case):
+    """Per-block cost of evicting it out of the packed core (lower = cheaper).
+
+    Boundary/cluster/MIB membership and connectivity are what an eviction
+    damages, so they dominate; area breaks ties (a big block grows the shelf)."""
+    cons = case['cons'].numpy()
+    n = cons.shape[0]
+    area = case['area'].numpy().astype(np.float64)
+    b2b = case['b2b'].numpy()
+    p2b = case['p2b'].numpy()
+    wdeg = np.zeros(n)
+    if len(b2b):
+        np.add.at(wdeg, b2b[:, 0].astype(np.int64), b2b[:, 2])
+        np.add.at(wdeg, b2b[:, 1].astype(np.int64), b2b[:, 2])
+    if len(p2b):
+        np.add.at(wdeg, p2b[:, 1].astype(np.int64), p2b[:, 2])
+    wn = wdeg / max(float(wdeg.max()), 1e-12)
+    an = area / max(float(area.max()), 1e-12)
+    return (4.0 * (cons[:, 4] > 0) + 2.0 * (cons[:, 3] > 0)
+            + 1.0 * (cons[:, 2] > 0) + 2.0 * wn + 1.0 * an)
+
+
+def _rebuild_evicted(n, H_core, V_core, evicted, keyx):
+    """Relation set for the evicted set: every evicted block is a V-successor of
+    every core block (so it sits above the whole core, and can lie on no
+    anchor-to-anchor path in either graph), and evicted blocks relate to each
+    other in H, ordered by keyx (so they share one shelf row instead of
+    stacking).  Both graphs stay acyclic:
+      - V gains only core -> evicted arcs; evicted blocks have no V out-arcs.
+      - H gains only evicted <-> evicted arcs, oriented by a fixed total order.
+    """
+    E = list(evicted)
+    Eset = set(E)
+    H = [e for e in H_core if e[0] not in Eset and e[1] not in Eset]
+    V = [e for e in V_core if e[0] not in Eset and e[1] not in Eset]
+    core = [k for k in range(n) if k not in Eset]
+    for m in E:
+        for k in core:
+            V.append((k, int(m)))
+    ranked = sorted(E, key=lambda m: (keyx[m], m))
+    for a in range(len(ranked)):
+        for b in range(a + 1, len(ranked)):
+            H.append((int(ranked[a]), int(ranked[b])))
+    return H, V
+
+
+def evict_for_consistency(n, H, V, sol, pre_mask, keyx, keyy, score,
+                          max_evict=None):
+    """Make BOTH axis relation sets consistent with the preplaced anchors by
+    evicting non-anchor blocks (see FEASIBILITY_ANALYSIS.md 4.1-4.2).
+
+    The x-system {x_j >= x_i + w_i on H, x_i = x_i* on P} is feasible iff no
+    anchor pair (a,b) has longest-path d_H(a,b) > x_b* - x_a*; with no fixed
+    outline nothing else can bind.  `_find_conflict` (origin=-inf) decides this
+    exactly.  Evicting a non-anchor block off a critical path strictly shrinks
+    the set of non-anchor blocks lying on any anchor-to-anchor path, so the loop
+    terminates after at most n - |P| evictions; the degenerate end state is
+    "every movable block in the shelf above", which is trivially consistent.
+
+    Returns (H, V, ordx, ordy, evicted) with both systems conflict-free, or
+    None if an anchor pair conflicts directly (the instance itself is broken).
+    """
+    H_core, V_core = list(H), list(V)
+    evicted = []
+    cap = max_evict if max_evict is not None else n
+    keyy_e = np.asarray(keyy, dtype=np.float64).copy()
+    big = float(keyy_e.max()) + 1.0 if n else 1.0
+    x, y = sol[:, 0], sol[:, 1]
+    w, h = sol[:, 2], sol[:, 3]
+
+    for _ in range(cap + 1):
+        ordx = np.lexsort((np.arange(n), keyx)).tolist()
+        ordy = np.lexsort((np.arange(n), keyy_e)).tolist()
+        res = _find_conflict(n, H, x, w, pre_mask, ordx)
+        axis_nodes = res[1] if res is not None else None
+        if axis_nodes is None:
+            res = _find_conflict(n, V, y, h, pre_mask, ordy)
+            axis_nodes = res[1] if res is not None else None
+        if axis_nodes is None:
+            return H, V, ordx, ordy, evicted
+        cand = [int(v) for v in axis_nodes
+                if not pre_mask[v] and v not in evicted]
+        if not cand or len(evicted) >= cap:
+            return None
+        m = min(cand, key=lambda v: (score[v], v))
+        evicted.append(m)
+        keyy_e[m] = big + len(evicted)
+        H, V = _rebuild_evicted(n, H_core, V_core, evicted, keyx)
+    return None
+
+
+def guaranteed_construction(pred, case, cfg=None):
+    """Absolute feasibility floor: overlap-free BY CONSTRUCTION, no search.
+
+    Anchors keep their exact geometry; every movable block is shelf-packed in
+    the empty half-plane above the highest anchor, in predicted reading order so
+    HPWL locality survives as far as a shelf allows.  Soft dims keep the
+    predicted aspect with area = area_scale * target; fixed dims are exact.
+    Feasibility does not depend on the input in any way, which is the point:
+    this is the candidate that bounds the damage from failure modes we have not
+    imagined.
+    """
+    cfg = {**DEFAULT_CFG, **(cfg or {})}
+    sol = np.asarray(pred, dtype=np.float64).copy()
+    cons = case['cons'].numpy()
+    gt = target_xywh(case).numpy().astype(np.float64)
+    pre = cons[:, 1] > 0
+    fix = cons[:, 0] > 0
+    soft = (~pre) & (~fix)
+    area = case['area'].numpy().astype(np.float64)
+
+    asc = float(cfg.get('area_scale', 1.0))
+    cap = float(cfg.get('reshape_aspect_cap', 3.6))
+    ar = np.clip(sol[soft, 2] / np.maximum(sol[soft, 3], 1e-12), 1.0 / cap, cap)
+    tgt = area[soft] * asc
+    sol[soft, 2] = np.sqrt(tgt * ar)
+    sol[soft, 3] = tgt / sol[soft, 2]
+    sol[fix, 2:4] = gt[fix, 2:4]
+    sol[pre] = gt[pre]
+
+    mov = np.nonzero(~pre)[0]
+    if not len(mov):
+        return sol
+    if pre.any():
+        x_org = float(gt[pre, 0].min())
+        y_base = float((gt[pre, 1] + gt[pre, 3]).max())
+        shelf_w = float((gt[pre, 0] + gt[pre, 2]).max()) - x_org
+    else:
+        x_org = float(sol[mov, 0].min())
+        y_base = float(sol[mov, 1].min())
+        shelf_w = 0.0
+    span = float(np.sqrt((sol[mov, 2] * sol[mov, 3]).sum()))
+    width = max(shelf_w, span, float(sol[mov, 2].max()))
+    order = sorted(mov.tolist(), key=lambda i: (pred[i, 1], pred[i, 0], i))
+    cx, cy, row_h = x_org, y_base, 0.0
+    for i in order:
+        if cx > x_org and cx + sol[i, 2] > x_org + width:
+            cx, cy, row_h = x_org, cy + row_h, 0.0
+        sol[i, 0], sol[i, 1] = cx, cy
+        cx += sol[i, 2]
+        row_h = max(row_h, float(sol[i, 3]))
+    return sol
+
+
+def _free_positions(sol, i, xs, ys, others, eps=_EPS_OVL):
+    """Boolean grid over (xs, ys) of positions where block i fits with no
+    overlap against `others`.  Exact -- the official two-axis test.
+
+    A candidate (x, y) collides with block k iff it penetrates on BOTH axes,
+    and each axis' penetration depends on only one of x, y.  So the (A, B) grid
+    is a boolean matrix product of the per-axis (A, K) and (B, K) masks, which
+    keeps this O(A*K + B*K + A*B) instead of materialising an (A, B, K) cube
+    (~110 MB for n=120, times every worker).
+    """
+    w, h = sol[i, 2], sol[i, 3]
+    X = np.asarray(xs)[:, None]
+    Y = np.asarray(ys)[:, None]
+    ox0 = sol[others, 0][None, :]
+    oy0 = sol[others, 1][None, :]
+    ox = np.minimum(X + w, ox0 + sol[others, 2][None, :]) - np.maximum(X, ox0)
+    oy = np.minimum(Y + h, oy0 + sol[others, 3][None, :]) - np.maximum(Y, oy0)
+    OX = (ox > eps).astype(np.float32)          # (A, K)
+    OY = (oy > eps).astype(np.float32)          # (B, K)
+    return (OX @ OY.T) < 0.5                    # free iff no k penetrates both
+
+
+def hole_relocate(sol, case, targets, pre_mask, cfg, S, hpwl_base, area_base,
+                  n_soft, nbr_i=None, alpha=None):
+    """Pull `targets` (typically the blocks stage E evicted into the shelf) back
+    into free space.
+
+    Candidate positions are the corner grid of the other blocks -- the classic
+    result that an optimal placement of one rectangle among fixed ones has a
+    corner-touching optimum, so the grid loses nothing.  Ranking is by a cheap
+    surrogate (exact weighted-HPWL delta + bbox growth); only the few best are
+    scored with the real proxy.  Every accepted move is verified overlap-free by
+    the exact official test AND must strictly improve the proxy, so this stage
+    can never turn a feasible layout infeasible.
+    """
+    t0 = time.perf_counter()
+    sol = sol.copy()
+    n = sol.shape[0]
+    stats = {'tried': 0, 'moved': 0, 'no_free': 0, 'runtime_s': 0.0}
+    tg = [int(i) for i in targets if not pre_mask[i]]
+    if not tg:
+        return sol, stats
+    if nbr_i is None:
+        nbr_i = _nbr_lists(case, n)
+    if alpha is None:
+        alpha = 0.5 / max(hpwl_base, 1e-6)
+    garea = 0.5 / max(area_base, 1e-6)
+    budget = float(cfg.get('reclaim_budget_s', 0.05))
+    cap = int(cfg.get('reclaim_trials', 24))
+    top = int(cfg.get('reclaim_probe', 8))
+    best_cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+    if best_cost >= 10.0:
+        return sol, stats                     # never gamble on a broken layout
+
+    # biggest first: the shelf blocks that cost the most bbox come back first
+    tg.sort(key=lambda i: -(sol[i, 2] * sol[i, 3]))
+    for i in tg[:cap]:
+        if time.perf_counter() - t0 > budget:
+            break
+        stats['tried'] += 1
+        others = np.array([k for k in range(n) if k != i], dtype=np.int64)
+        xs = np.unique(np.concatenate([sol[others, 0],
+                                       sol[others, 0] + sol[others, 2]]))
+        ys = np.unique(np.concatenate([sol[others, 1],
+                                       sol[others, 1] + sol[others, 3]]))
+        ok = _free_positions(sol, i, xs, ys, others)
+        if not ok.any():
+            stats['no_free'] += 1
+            continue
+        # surrogate: exact HPWL delta on both axes + bbox growth of the union
+        bx0 = float(sol[others, 0].min())
+        bx1 = float((sol[others, 0] + sol[others, 2]).max())
+        by0 = float(sol[others, 1].min())
+        by1 = float((sol[others, 1] + sol[others, 3]).max())
+        cand = np.argwhere(ok)
+        dh = np.empty(len(cand))
+        for r, (a, b) in enumerate(cand):
+            x, y = float(xs[a]), float(ys[b])
+            dh[r] = (_hpwl_delta(i, 0, x, sol, nbr_i)
+                     + _hpwl_delta(i, 1, y, sol, nbr_i))
+        nx0 = np.minimum(bx0, xs[cand[:, 0]])
+        nx1 = np.maximum(bx1, xs[cand[:, 0]] + sol[i, 2])
+        ny0 = np.minimum(by0, ys[cand[:, 1]])
+        ny1 = np.maximum(by1, ys[cand[:, 1]] + sol[i, 3])
+        area_now = (max(bx1, sol[i, 0] + sol[i, 2]) - min(bx0, sol[i, 0])) * \
+                   (max(by1, sol[i, 1] + sol[i, 3]) - min(by0, sol[i, 1]))
+        da = (nx1 - nx0) * (ny1 - ny0) - area_now
+        sur = alpha * dh + garea * da
+        probe = np.argsort(sur)[:top]
+        keep = (float(sol[i, 0]), float(sol[i, 1]))
+        for r in probe:
+            a, b = cand[r]
+            sol[i, 0], sol[i, 1] = float(xs[a]), float(ys[b])
+            c = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+            if c < best_cost - 1e-12:
+                best_cost = c
+                keep = (float(sol[i, 0]), float(sol[i, 1]))
+                stats['moved'] += 1
+                break
+        sol[i, 0], sol[i, 1] = keep
+    stats['runtime_s'] = time.perf_counter() - t0
+    return sol, stats
+
+
 # ------------------------------------------------------------------ driver
 
 def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
@@ -1937,6 +2197,9 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
     n_soft = _n_soft_norm(cons)
     alpha = 0.5 / max(hpwl_base, 1e-6)
     nbr_i = _nbr_lists(case, n)
+    evict_score = _eviction_score(case)
+    case_stats = {'evict_rounds': 0, 'evicted_total': 0, 'evict_ok': 0,
+                  'evicted_set': set()}
 
     bits = cons[:, 4]
     tgt_ext = (float((pred[:, 0] + pred[:, 2]).max() - pred[:, 0].min()),
@@ -1970,7 +2233,8 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         org = [w if w is not None else -np.inf for w in wall_lo]
 
         graph_info = {'repair_failures': 0, 'assign_failures': 0,
-                      'final_assignment_ok': False}
+                      'final_assignment_ok': False, 'evicted': 0,
+                      'evicted_blocks': []}
         H, V = build_graph(geo, keyx, keyy)
         H, V, wd, hd, ok = repair_graph(H, V, geo, keyx, keyy, pre_mask,
                                        shrinkable, areas,
@@ -2121,6 +2385,25 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
             assigned = do_assign(True, False)
             if not assigned:
                 assigned = do_assign(False, False)
+        # last rung: the relation set itself is inconsistent with the anchors,
+        # so no wall relaxation can help.  Evict non-anchor blocks off the
+        # conflicting critical paths until it is consistent -- then lb_i <= U_i
+        # holds for every block and the assignment is overlap-free BY
+        # CONSTRUCTION (see FEASIBILITY_ANALYSIS.md, Lemma 3 + Theorem 2).
+        if not assigned and cfg.get('evict_repair', True):
+            ev = evict_for_consistency(
+                n, H, V, sol, pre_mask, keyx, keyy, evict_score,
+                max_evict=int(cfg.get('evict_max', 64)))
+            if ev is not None:
+                H2, V2, ordx, ordy, evicted = ev
+                H[:], V[:] = H2, V2
+                graph_info['evicted'] = len(evicted)
+                graph_info['evicted_blocks'] = list(evicted)
+                assigned = do_assign(False, False)
+                case_stats['evict_rounds'] += 1
+                case_stats['evicted_total'] += len(evicted)
+                case_stats['evict_ok'] += int(bool(assigned))
+                case_stats['evicted_set'].update(int(v) for v in evicted)
         graph_info['final_assignment_ok'] = bool(assigned)
         adjH = _adj_arrays(n, H)
         adjV = _adj_arrays(n, V)
@@ -2202,6 +2485,17 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
     ripple_info['group_final'] = _violations_official(sol, cons)[1]
 
+    # Stage E-2: stage E parks evicted blocks in a shelf above the core, which
+    # is feasible but expensive in bbox and HPWL. Pull them back into free
+    # holes; exact-overlap + proxy gated, so it only ever improves.
+    reclaim_info = {'tried': 0, 'moved': 0, 'no_free': 0, 'runtime_s': 0.0}
+    if (cost < 9 and cfg.get('reclaim', True)
+            and case_stats['evicted_total'] > 0):
+        sol, reclaim_info = hole_relocate(
+            sol, case, case_stats['evicted_set'], pre_mask, cfg, S,
+            hpwl_base, area_base, n_soft, nbr_i, alpha)
+        cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+
     # Detailed placement must not perturb immutable fields. Re-stamp them before
     # the authoritative hard gate; any overlap exposed by this restoration makes
     # the candidate infeasible rather than silently moving an immutable block.
@@ -2209,8 +2503,23 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
     sol[fixed_mask, 2:4] = gt[fixed_mask, 2:4]
     hard = hard_feasibility(sol, case)
     cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+
+    # Absolute feasibility floor: stage E makes the assignment overlap-free by
+    # construction, so reaching this branch means an unmodelled failure mode.
+    # A shelf construction is worth ~8.5 against the 10.0 penalty -- poor, but
+    # it bounds the damage from anything we have not imagined.
+    floor_used = False
+    if not hard['feasible'] and cfg.get('guaranteed_floor', True):
+        alt = guaranteed_construction(pred, case, cfg)
+        alt_hard = hard_feasibility(alt, case)
+        if alt_hard['feasible']:
+            alt_cost = proxy_cost(alt, case, hpwl_base, area_base, n_soft)
+            sol, hard, cost, floor_used = alt, alt_hard, alt_cost, True
     pen = hard['max_penetration']
     info = {'proxy_cost': cost, 'penetration': pen, 'hard': hard,
+            'floor_used': floor_used, 'reclaim': reclaim_info,
+            'evict': {k: (sorted(v) if isinstance(v, set) else v)
+                      for k, v in case_stats.items()},
             'move_mean': float(np.abs(sol[:, :2] - pred[:, :2]).mean() / S),
             'runtime_s': time.time() - t0, 'ripple': ripple_info,
             'reshape': reshape_info, 'mib': mib_info, 'graph': graph_info}
