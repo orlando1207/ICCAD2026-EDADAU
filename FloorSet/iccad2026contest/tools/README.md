@@ -92,3 +92,45 @@ the reclaim pass, so the end-to-end gain was only −0.0036 against the harness'
 (0.15-0.30 s) should convert most of that gap, and the runtime economics allow it on exactly the
 cases where E fires. **Must be measured on an idle box** — a wall-clock-budget test is meaningless
 at load average 60.
+
+
+## Measured: the DP-1 reshape fallback, ported from the `final` branch (2026-08-26)
+
+`_reshape_extend` + the `try_shift`/`try_reshape`/`slack_d` restructuring of `cluster_perp_align`,
+ported from `origin/final:cadc1111/floordiff/legalizer.py`. That branch forked at `de967bc`, before
+stage E and the hard-constraint work, so the branch was **not** merged -- only this mechanism was
+lifted, with an aspect guard added.
+
+Why it reaches something we could not: the DP-3 group path filters candidates with
+`0.0 < gap <= close_cap and ov > delta`, so it needs a positive gap **and** an existing
+perpendicular overlap. The dominant residual is the opposite -- 68 of 71 violating groups touch at
+gap exactly 0 with disjoint perpendicular intervals -- so DP-3 generates no candidate for it. The
+reshape grows the block along the axis that needs overlap while holding the far edge fixed, which
+is also exactly the case where `_shift_slack` is 0 because that edge is pinned.
+
+All three sets improve, deterministic (budgets neutralised), feasibility preserved:
+
+| set | before | after | Δ | violations |
+|---|---|---|---|---|
+| official 100 | 1.0466 | **1.0417** | **−0.0049** | boundary 42→37, grouping 13→7 |
+| regular 200 | 1.2139 | **1.2048** | **−0.0091** | boundary 103→81, grouping 57→46, MIB 780 unchanged |
+| stress 156 | 1.6633 | **1.6531** | **−0.0102** | 156/156 feasible, unchanged |
+
+Per case: official 42 better / 13 worse; regular 104 better / 15 worse. `t/case` did not rise
+(3.22 → 3.10 official) -- the reshape resolves groups in fewer loop iterations.
+
+**The ordering rule carries the gain, not the reshape.** `reshape_align_order`:
+
+| order | official total |
+|---|---|
+| **`pin`** (reshape first only for a mover satisfying a boundary bit on the shift axis) | **1.0417** |
+| `reshape` (always reshape first) | 1.0457 |
+| `shift` (always shift first) | 1.0456 |
+
+So the reshape alone is worth ~0.0009; knowing *when* to prefer it is worth 0.0040. The mechanism
+is not "reshaping closes gaps" but "reshaping preserves a boundary contact that a shift would drag
+off the wall" -- which is why boundary violations fall further than grouping ones.
+
+Insensitive knobs: `reshape_min_frac` 0.15 / 0.3 / 0.5 all give 1.0417; `perp_moves` 80 does not
+bind. The added `reshape_align_aspect=3.6` guard costs 0.0001 and is kept as cheap insurance
+against compounding elongation (`min_frac` alone permits a 3.3x stretch per move).

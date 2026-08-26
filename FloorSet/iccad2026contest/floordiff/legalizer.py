@@ -60,6 +60,17 @@ DEFAULT_CFG = {
     'cluster_drag_rel': 0.30,  # skip merges needing a drag beyond this x S
     'perp_align': True,      # stage DP-1: shared-edge repair within graph slack
     'perp_moves': 40,        # max slack shifts per cluster_perp_align call
+    # DP-1 area-preserving reshape fallback (ported from the `final` branch).
+    # Reaches the corner-touch residual that a shift cannot: 68 of 71 violating
+    # groups touch at gap exactly 0 with disjoint perpendicular intervals, and
+    # the DP-3 group path skips those (it needs 0 < gap and existing overlap).
+    'reshape_align': True,
+    'reshape_min_frac': 0.3,    # perpendicular side may not shrink below this
+    'reshape_align_aspect': 3.6,  # None disables the added aspect guard
+    # which repair to attempt first: 'pin' tries reshape first only for a mover
+    # that satisfies a boundary bit on the shift axis (a shift would drag it off
+    # the wall), else shift first. 'reshape'/'shift' force one order.
+    'reshape_align_order': 'pin',
     'cluster_align': True,   # stage L: band-align cluster members at assignment
                              # time (while slack still exists) so abutting
                              # members share an edge instead of a corner
@@ -1248,6 +1259,57 @@ def _perp_shift(pm, sm, pf, sf, delta):
     return (delta - ov) if pm < pf else -(delta - ov)
 
 
+def _reshape_extend(pos_sep, size_sep, pos_perp, size_perp, need, min_frac,
+                    perp_center_target=None, aspect_cap=None):
+    """Area-preserving alternative to a rigid shift along `sep`.
+
+    A translation drags BOTH edges of the block, including one that may be
+    sitting exactly on a satisfied boundary bit or pinned by a preplaced
+    neighbour -- which is precisely when `_shift_slack` is 0 and the shift is
+    impossible. Instead grow the edge facing the target by |need|, hold the far
+    edge fixed, and shrink the perpendicular side to conserve area exactly:
+
+        size_sep' = size_sep + |need|          size_perp' = area / size_sep'
+
+    so the block gains the overlap the shared edge needs without the far edge
+    moving at all. Returns (pos_sep, size_sep, pos_perp, size_perp) or None.
+
+    The freed perpendicular width (`size_perp - size_perp'`) can be shed from
+    either side, or split, without claiming any space the block did not already
+    occupy -- every split in [pos_perp, pos_perp + freed] is equally safe. So
+    when `perp_center_target` is given (the weighted-median centre this block's
+    own nets want, the same target `polish` chases) the width is shed from
+    whichever side moves the centre towards it, and the sacrifice doubles as
+    HPWL compensation instead of a wasted symmetric shrink.
+
+    Ported from the `final` branch (`cadc1111/floordiff/legalizer.py`,
+    `_reshape_extend`); `aspect_cap` is added here -- `min_frac` alone allows
+    the perpendicular side to shrink to 30%, i.e. a 3.3x elongation per move,
+    and the loop can apply several. The cap only blocks a move that both
+    exceeds it AND makes the aspect worse, so it never rejects an improvement.
+    """
+    if need == 0.0 or size_sep + abs(need) <= 1e-9:
+        return None
+    area = size_sep * size_perp
+    size_sep1 = size_sep + abs(need)
+    size_perp1 = area / size_sep1
+    if size_perp1 < min_frac * size_perp:
+        return None
+    if aspect_cap:
+        asp0 = max(size_sep / size_perp, size_perp / size_sep)
+        asp1 = max(size_sep1 / size_perp1, size_perp1 / size_sep1)
+        if asp1 > aspect_cap and asp1 > asp0:
+            return None
+    pos_sep1 = (pos_sep + size_sep) - size_sep1 if need < 0 else pos_sep
+    freed = size_perp - size_perp1
+    if perp_center_target is None:
+        pos_perp1 = pos_perp + freed / 2.0
+    else:
+        lo_edge_target = perp_center_target - size_perp1 / 2.0
+        pos_perp1 = min(max(lo_edge_target, pos_perp), pos_perp + freed)
+    return pos_sep1, size_sep1, pos_perp1, size_perp1
+
+
 def _abut_delta(sol, m, f, delta):
     """(dx, dy) moving block m to abut block f face-to-face on their more-
     separated axis, with a >= delta shared edge on the other axis."""
@@ -1295,7 +1357,7 @@ def _shift_slack(moving, m, preds, succs, pos, size):
 
 
 def cluster_perp_align(sol, case, adjH, adjV, pre_mask, cfg, S,
-                       hpwl_base, area_base, n_soft):
+                       hpwl_base, area_base, n_soft, nbr_i=None):
     """Stage DP-1: give split cluster components a real SHARED EDGE.
 
     Measured dominant residual (70 of 71 violating groups): the two components
@@ -1323,6 +1385,16 @@ def cluster_perp_align(sol, case, adjH, adjV, pre_mask, cfg, S,
         return sol
     delta = cfg['delta_rel'] * S
     adj = (adjH, adjV)
+    if nbr_i is None:
+        nbr_i = _nbr_lists(case, sol.shape[0])
+    # the reshape fallback may only touch a block whose shape is not itself
+    # constrained: not fixed-shape, not tied to an MIB group, not preplaced
+    resh_ok = ((cons[:, 0] == 0) & (cons[:, 2] == 0) & (~pre_mask)
+               if cfg.get('reshape_align', True)
+               else np.zeros(len(cons), dtype=bool))
+    resh_min = float(cfg.get('reshape_min_frac', 0.3))
+    resh_asp = cfg.get('reshape_align_aspect', 3.6)
+    resh_order = cfg.get('reshape_align_order', 'pin')
     base = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
     if base >= 10.0:
         return sol                                # infeasible input: leave it
@@ -1368,11 +1440,19 @@ def cluster_perp_align(sol, case, adjH, adjV, pre_mask, cfg, S,
                                        [int(i) for i in comp]))
                 trials = [t[1:] for t in sorted(trials, key=lambda t: t[0])]
 
-                for m, f, grp in trials:
-                    need = _perp_shift(sol[m, sep], sol[m, 2 + sep],
-                                       sol[f, sep], sol[f, 2 + sep], delta)
-                    if need == 0.0:
-                        continue
+                def slack_d(grp, need):
+                    """Largest displacement of `grp` along `sep` that graph
+                    slack allows, clamped towards `need`.
+
+                    Shared by shift and reshape, and correct for both: a
+                    translation moves the whole block by d, while a reshape
+                    moves only the edge facing the target by d. For need > 0
+                    both push the high edge to `pos + size + d`, bounded by
+                    `hi_d`; for need < 0 both put the low edge at `pos + d`,
+                    bounded by `lo_d`. Clamping matters because the raw `need`
+                    carries a `delta` margin aimed at the *target component*,
+                    which is not a graph-neighbour bound and would otherwise
+                    walk straight into a real neighbour."""
                     moving = set(grp)
                     lo_d, hi_d = -np.inf, np.inf
                     for i in grp:
@@ -1381,18 +1461,85 @@ def cluster_perp_align(sol, case, adjH, adjV, pre_mask, cfg, S,
                         lo_d = max(lo_d, lo - sol[i, sep])
                         hi_d = min(hi_d, hi - sol[i, sep])
                     d = min(max(need, lo_d), hi_d)
-                    if not np.isfinite(d) or abs(d) < 1e-12:
-                        continue
-                    idx = np.array(grp)
-                    old = sol[idx].copy()
-                    sol[idx, sep] += d
+                    if not (np.isfinite(d) and abs(d) >= 1e-12):
+                        return None
+                    return d
+
+                def commit(idx, old, c_base):
+                    """Keep a tentative edit only if it is exactly overlap-free
+                    AND improves the official proxy; otherwise roll back."""
                     ok = max_penetration(sol) <= _EPS_OVL
                     c = (proxy_cost(sol, case, hpwl_base, area_base, n_soft)
                          if ok else np.inf)
-                    if ok and c <= base - 1e-12:
+                    if ok and c <= c_base - 1e-12:
+                        return c
+                    sol[idx] = old
+                    return None
+
+                def try_shift(m, f, grp, d):
+                    idx = np.array(grp)
+                    old = sol[idx].copy()
+                    sol[idx, sep] += d
+                    return commit(idx, old, base)
+
+                def try_reshape(m, f, grp, d):
+                    if not (len(grp) == 1 and resh_ok[m]):
+                        return None
+                    # the freed width can be shed from either side for free, so
+                    # aim it at the weighted-median centre m's own nets want --
+                    # the sacrifice doubles as HPWL compensation
+                    paxis = 1 - sep
+                    tgt = None
+                    if nbr_i[m]:
+                        vals, wts = [], []
+                        for (j, wgt, pxy) in nbr_i[m]:
+                            vals.append((sol[j, paxis] + sol[j, 2 + paxis] / 2)
+                                        if j >= 0 else pxy[paxis])
+                            wts.append(wgt)
+                        order = np.argsort(vals)
+                        cum = np.cumsum(np.asarray(wts, dtype=np.float64)[order])
+                        tgt = vals[int(order[np.searchsorted(cum,
+                                                            cum[-1] / 2)])]
+                    r = _reshape_extend(sol[m, sep], sol[m, 2 + sep],
+                                        sol[m, paxis], sol[m, 2 + paxis],
+                                        d, resh_min, perp_center_target=tgt,
+                                        aspect_cap=resh_asp)
+                    if r is None:
+                        return None
+                    idx = np.array([m])
+                    old = sol[idx].copy()
+                    (sol[m, sep], sol[m, 2 + sep],
+                     sol[m, paxis], sol[m, 2 + paxis]) = r
+                    return commit(idx, old, base)
+
+                for m, f, grp in trials:
+                    need = _perp_shift(sol[m, sep], sol[m, 2 + sep],
+                                       sol[f, sep], sol[f, 2 + sep], delta)
+                    if need == 0.0:
+                        continue
+                    d = slack_d(grp, need)
+                    if d is None:
+                        continue
+                    # a shift along `sep` drags the block off any boundary bit
+                    # it satisfies on this same axis, so for such a mover try
+                    # the reshape FIRST (it holds that edge fixed); otherwise
+                    # shift first -- cheaper, no shape change -- and reshape
+                    # only when the shift has no room or does not pay.
+                    pin_m = bool(int(cons_bits[m]) & bits_ax)
+                    if resh_order == 'reshape':
+                        first = True
+                    elif resh_order == 'shift':
+                        first = False
+                    else:                       # 'pin' (default)
+                        first = pin_m
+                    order = ((try_reshape, try_shift) if first
+                             else (try_shift, try_reshape))
+                    c = order[0](m, f, grp, d)
+                    if c is None:
+                        c = order[1](m, f, grp, d)
+                    if c is not None:
                         base, improved, moves = c, True, moves + 1
                         break
-                    sol[idx] = old
                 if improved:
                     break                         # components changed: recompute
     return sol
@@ -2514,7 +2661,7 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         # (free space is already gone by this point -- see cluster_perp_align)
         if cfg.get('perp_align', True):
             s = cluster_perp_align(s, case, aH, aV, pre_mask, cfg, S,
-                                   hpwl_base, area_base, n_soft)
+                                   hpwl_base, area_base, n_soft, nbr_i)
         return (proxy_cost(s, case, hpwl_base, area_base, n_soft), s,
                 _H, _V, graph_info)
 
