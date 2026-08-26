@@ -12,3 +12,5 @@ CLAUDE.md
 /FloorSet/iccad2026contest/floordiff/out
 /FloorSet/iccad2026contest/floordiff/cache
 /FloorSet/reference
+/cadc1111/floordiff/checkpoints
+*:Zone.Identifier
