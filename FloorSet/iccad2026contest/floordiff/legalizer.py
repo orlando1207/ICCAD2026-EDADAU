@@ -96,11 +96,38 @@ DEFAULT_CFG = {
                              # critical paths until the relation set is
                              # consistent -> assignment cannot overlap
     'evict_max': 64,         # eviction budget per legal_round
+    # 'above' | 'right' | 'auto'. Keep 'above'. 'auto' picks the side that looks
+    # cheaper in bbox area and MEASURED WORSE (stress kit total 1.6938 -> 1.7833,
+    # 23 cases better / 42 worse): a shelf above the core sits ON the bbox's top
+    # edge, so evicted blocks satisfy a TOP boundary bit for free -- only 1% of
+    # boundary violations land on evicted blocks. Moving the shelf sideways
+    # throws that away for an area saving that does not cover it.
+    'evict_shelf': 'above',
+    # victim scoring: (boundary, cluster, mib, degree, area)
+    'evict_weights': (4.0, 2.0, 1.0, 2.0, 1.0),
     'reclaim': True,         # pull evicted blocks back into free holes
     'reclaim_trials': 24,    # max blocks reclaimed per call
     'reclaim_probe': 8,      # free positions scored with the real proxy per block
+    'reclaim_round': True,   # re-run a legal round so the soft stages see the
+                             # reclaimed blocks (they were in the shelf before)
     'reclaim_budget_s': 0.05,
     'guaranteed_floor': True,   # never return an infeasible solution
+    # relation-set construction (see build_graph)
+    'graph_rule': 'gap',     # 'gap' | 'norm' | 'square' | 'anchor'
+    'graph_square_k': 0.25,  # 'square' bias strength toward the shorter bbox side
+    'graph_key': 'center',   # per-axis total order: 'center' | 'edge'
+    # Graph rebuilds from legal geometry. Measured on the official 100 with the
+    # DP time budgets neutralised (see tools/README.md): 2 -> 1.0492,
+    # 3 -> 1.0466, 5 -> 1.0466, i.e. the gain saturates at 3. `legal_round_stop`
+    # takes that gain at close to 2-round wall-clock by stopping as soon as a
+    # rebuild fails to improve the proxy.
+    'legal_rounds': 3,
+    'legal_round_stop': True,
+    # stage-G shape (were hard-coded; exposed so they can be A/B'd)
+    'g_omega': 0.8,          # overlap-impulse relaxation
+    'g_drift_rel': 0.002,    # quality-gradient step cap, x S per iteration
+    'g_spring_rate': 0.4,    # boundary/cluster gap fraction closed per iteration
+    'g_spring_cap_rel': 0.01,
 }
 
 _EPS_OVL = 1e-6              # official: pair violates only if BOTH axes > 1e-6
@@ -495,8 +522,8 @@ def gradient_phase(pred, case, pre_mask, cfg, S, hpwl_base, area_base,
         g[:, 1] += garea * W * (soft(y1, True) - soft(y0, False))
         return g
 
-    spring_rate = 0.4              # fraction of the gap closed per iteration
-    spring_cap = 0.01 * S
+    spring_rate = float(cfg.get('g_spring_rate', 0.4))   # gap fraction / iter
+    spring_cap = float(cfg.get('g_spring_cap_rel', 0.01)) * S
 
     def spring_impulse(cc):
         """Direct gap-closing moves for boundary attachment and cluster
@@ -540,8 +567,8 @@ def gradient_phase(pred, case, pre_mask, cfg, S, hpwl_base, area_base,
         return d
 
     anchor_k = cfg['anchor_w'] / S
-    omega = 0.8                  # impulse relaxation
-    drift_cap = 0.002 * S        # max per-block quality drift per iteration
+    omega = float(cfg.get('g_omega', 0.8))               # impulse relaxation
+    drift_cap = float(cfg.get('g_drift_rel', 0.002)) * S  # per-block quality drift
 
     c = c0.copy()
     for it in range(iters):
@@ -571,16 +598,58 @@ def gradient_phase(pred, case, pre_mask, cfg, S, hpwl_base, area_base,
 
 # ------------------------------------------------------------------ stage L
 
-def build_graph(xywh, keyx, keyy):
-    """Axis per pair (H if x-gap >= y-gap), oriented by the FIXED keys.
-    Returns (H, V) lists of (leader, follower)."""
+def build_graph(xywh, keyx, keyy, rule='gap', pre_mask=None, square_k=0.25):
+    """Axis per pair, oriented by the FIXED keys. Returns (H, V) lists of
+    (leader, follower).
+
+    `rule` selects which axis a pair is assigned to:
+      'gap'    H iff x-gap >= y-gap.  For an overlapping pair both gaps are
+               negative and this picks the smaller penetration, i.e. the cheaper
+               axis to separate on; for a separated pair it picks the axis with
+               more margin.
+      'norm'   the same comparison on gaps normalised by the pair's summed
+               extent, so which axis is "cheaper" does not depend on the blocks
+               being wide or tall.
+      'square' 'norm' plus a bias onto the shorter bbox side -- MEASURED HARMFUL,
+               see the note in the body; do not enable.
+      'anchor' 'gap', except that for a pair with exactly one preplaced member
+               an axis on which the two are ALREADY disjoint wins.  Such a
+               relation holds at the anchor's fixed coordinate by construction,
+               so it can never put the block on an over-full anchor-to-anchor
+               path -- it removes single-anchor conflicts before stage E has to.
+    """
     x0, y0, w, h = xywh[:, 0], xywh[:, 1], xywh[:, 2], xywh[:, 3]
     x1, y1 = x0 + w, y0 + h
     gx = np.maximum(x0[:, None], x0) - np.minimum(x1[:, None], x1)
     gy = np.maximum(y0[:, None], y0) - np.minimum(y1[:, None], y1)
     n = len(x0)
     iu, ju = np.triu_indices(n, k=1)
-    horiz = gx[iu, ju] >= gy[iu, ju]
+    if rule in ('norm', 'square'):
+        sx = np.maximum(w[iu] + w[ju], 1e-12)
+        sy = np.maximum(h[iu] + h[ju], 1e-12)
+        score = gx[iu, ju] / sx - gy[iu, ju] / sy
+        if rule == 'square':
+            # MEASURED HARMFUL -- kept only to document the negative result.
+            # The idea was that a pair placed in H stands side by side (growing
+            # width) while in V it stacks (growing height), so biasing ambiguous
+            # pairs onto the shorter bbox side should square the layout up. It
+            # does the opposite: piling relations onto one axis lengthens that
+            # axis' critical path, so the assignment's minimum extent grows.
+            # Official 100, runtime-neutral total vs 1.0496 baseline:
+            #   k=0.15 1.0467 · k=0.25 1.3607 · k=0.50 1.5262 · k=1.00 1.7279
+            # k=0.15's small win does not survive the cliff behind it.
+            bw = float(x1.max() - x0.min())
+            bh = float(y1.max() - y0.min())
+            score -= square_k * math.log(max(bw, 1e-12) / max(bh, 1e-12))
+        horiz = score >= 0
+    else:
+        horiz = gx[iu, ju] >= gy[iu, ju]
+    if rule == 'anchor' and pre_mask is not None and pre_mask.any():
+        one_anchor = pre_mask[iu] ^ pre_mask[ju]
+        sep_x = gx[iu, ju] >= 0.0
+        sep_y = gy[iu, ju] >= 0.0
+        horiz = np.where(one_anchor & sep_x & ~sep_y, True,
+                         np.where(one_anchor & sep_y & ~sep_x, False, horiz))
 
     def orient(ii, jj, key):
         swap = (key[ii] > key[jj]) | ((key[ii] == key[jj]) & (ii > jj))
@@ -1913,11 +1982,15 @@ def shape_detail_repair(sol, case, pre_mask, shrinkable, cfg, S,
 
 # ------------------------------------------------------- stage E: eviction
 
-def _eviction_score(case):
+def _eviction_score(case, weights=None):
     """Per-block cost of evicting it out of the packed core (lower = cheaper).
 
-    Boundary/cluster/MIB membership and connectivity are what an eviction
-    damages, so they dominate; area breaks ties (a big block grows the shelf)."""
+    Weights are (boundary, cluster, mib, weighted-degree, area). Note the
+    boundary weight is deliberately LOW: the shelf sits on the bbox's top edge,
+    so an evicted block usually keeps a TOP bit for free -- measured, only 1% of
+    boundary violations land on evicted blocks -- while 75% of split cluster
+    groups contain one. Protecting group membership matters; protecting boundary
+    membership mostly wastes the budget."""
     cons = case['cons'].numpy()
     n = cons.shape[0]
     area = case['area'].numpy().astype(np.float64)
@@ -1931,36 +2004,42 @@ def _eviction_score(case):
         np.add.at(wdeg, p2b[:, 1].astype(np.int64), p2b[:, 2])
     wn = wdeg / max(float(wdeg.max()), 1e-12)
     an = area / max(float(area.max()), 1e-12)
-    return (4.0 * (cons[:, 4] > 0) + 2.0 * (cons[:, 3] > 0)
-            + 1.0 * (cons[:, 2] > 0) + 2.0 * wn + 1.0 * an)
+    wb, wc, wm, wd, wa = weights if weights else (4.0, 2.0, 1.0, 2.0, 1.0)
+    return (wb * (cons[:, 4] > 0) + wc * (cons[:, 3] > 0)
+            + wm * (cons[:, 2] > 0) + wd * wn + wa * an)
 
 
-def _rebuild_evicted(n, H_core, V_core, evicted, keyx):
-    """Relation set for the evicted set: every evicted block is a V-successor of
-    every core block (so it sits above the whole core, and can lie on no
+def _rebuild_evicted(n, H_core, V_core, evicted, keyx, keyy, shelf='above'):
+    """Relation set for the evicted set.
+
+    With `shelf='above'`: every evicted block is a V-successor of every core
+    block (so it sits above the whole core, and by Lemma 4 can lie on no
     anchor-to-anchor path in either graph), and evicted blocks relate to each
-    other in H, ordered by keyx (so they share one shelf row instead of
-    stacking).  Both graphs stay acyclic:
-      - V gains only core -> evicted arcs; evicted blocks have no V out-arcs.
-      - H gains only evicted <-> evicted arcs, oriented by a fixed total order.
+    other in H, ordered by keyx -- they share one shelf ROW instead of stacking.
+    `shelf='right'` is the mirror image: H-successors of the core, V-ordered
+    among themselves, i.e. one shelf COLUMN beside the core.  Both keep each
+    graph acyclic (the added arcs run core -> evicted on one axis and along a
+    fixed total order on the other), so the guarantee is identical; the choice
+    only decides which bbox side pays for the shelf.
     """
     E = list(evicted)
     Eset = set(E)
     H = [e for e in H_core if e[0] not in Eset and e[1] not in Eset]
     V = [e for e in V_core if e[0] not in Eset and e[1] not in Eset]
     core = [k for k in range(n) if k not in Eset]
+    follow, along, key = (V, H, keyx) if shelf == 'above' else (H, V, keyy)
     for m in E:
         for k in core:
-            V.append((k, int(m)))
-    ranked = sorted(E, key=lambda m: (keyx[m], m))
+            follow.append((k, int(m)))
+    ranked = sorted(E, key=lambda m: (key[m], m))
     for a in range(len(ranked)):
         for b in range(a + 1, len(ranked)):
-            H.append((int(ranked[a]), int(ranked[b])))
+            along.append((int(ranked[a]), int(ranked[b])))
     return H, V
 
 
 def evict_for_consistency(n, H, V, sol, pre_mask, keyx, keyy, score,
-                          max_evict=None):
+                          max_evict=None, shelf='above'):
     """Make BOTH axis relation sets consistent with the preplaced anchors by
     evicting non-anchor blocks (see FEASIBILITY_ANALYSIS.md 4.1-4.2).
 
@@ -1978,13 +2057,17 @@ def evict_for_consistency(n, H, V, sol, pre_mask, keyx, keyy, score,
     H_core, V_core = list(H), list(V)
     evicted = []
     cap = max_evict if max_evict is not None else n
+    keyx_e = np.asarray(keyx, dtype=np.float64).copy()
     keyy_e = np.asarray(keyy, dtype=np.float64).copy()
-    big = float(keyy_e.max()) + 1.0 if n else 1.0
+    # the shelf axis' key must put the evicted blocks last, so that axis'
+    # argsort stays a topological order for the core -> evicted arcs
+    shelf_key = keyy_e if shelf == 'above' else keyx_e
+    big = float(shelf_key.max()) + 1.0 if n else 1.0
     x, y = sol[:, 0], sol[:, 1]
     w, h = sol[:, 2], sol[:, 3]
 
     for _ in range(cap + 1):
-        ordx = np.lexsort((np.arange(n), keyx)).tolist()
+        ordx = np.lexsort((np.arange(n), keyx_e)).tolist()
         ordy = np.lexsort((np.arange(n), keyy_e)).tolist()
         res = _find_conflict(n, H, x, w, pre_mask, ordx)
         axis_nodes = res[1] if res is not None else None
@@ -1999,8 +2082,9 @@ def evict_for_consistency(n, H, V, sol, pre_mask, keyx, keyy, score,
             return None
         m = min(cand, key=lambda v: (score[v], v))
         evicted.append(m)
-        keyy_e[m] = big + len(evicted)
-        H, V = _rebuild_evicted(n, H_core, V_core, evicted, keyx)
+        shelf_key[m] = big + len(evicted)
+        H, V = _rebuild_evicted(n, H_core, V_core, evicted, keyx_e, keyy_e,
+                                shelf)
     return None
 
 
@@ -2197,7 +2281,7 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
     n_soft = _n_soft_norm(cons)
     alpha = 0.5 / max(hpwl_base, 1e-6)
     nbr_i = _nbr_lists(case, n)
-    evict_score = _eviction_score(case)
+    evict_score = _eviction_score(case, cfg.get('evict_weights'))
     case_stats = {'evict_rounds': 0, 'evicted_total': 0, 'evict_ok': 0,
                   'evicted_set': set()}
 
@@ -2211,8 +2295,11 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         span=True drives extents into the preplaced boundary anchors' span
         (aggressive; used as a retry when anchors stay violated).
         Returns (sol, H, V, adjH, adjV)."""
-        keyx = geo[:, 0] + geo[:, 2] / 2
-        keyy = geo[:, 1] + geo[:, 3] / 2
+        if cfg.get('graph_key', 'center') == 'edge':
+            keyx, keyy = geo[:, 0].copy(), geo[:, 1].copy()
+        else:
+            keyx = geo[:, 0] + geo[:, 2] / 2
+            keyy = geo[:, 1] + geo[:, 3] / 2
 
         # preplaced boundary blocks pin the walls: the bbox edge must come to
         # them (they cannot move). Repairs treat the low wall as a source.
@@ -2235,7 +2322,8 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         graph_info = {'repair_failures': 0, 'assign_failures': 0,
                       'final_assignment_ok': False, 'evicted': 0,
                       'evicted_blocks': []}
-        H, V = build_graph(geo, keyx, keyy)
+        H, V = build_graph(geo, keyx, keyy, cfg.get('graph_rule', 'gap'),
+                           pre_mask, float(cfg.get('graph_square_k', 0.25)))
         H, V, wd, hd, ok = repair_graph(H, V, geo, keyx, keyy, pre_mask,
                                        shrinkable, areas,
                                        origin_x=org[0], origin_y=org[1])
@@ -2391,9 +2479,16 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
         # holds for every block and the assignment is overlap-free BY
         # CONSTRUCTION (see FEASIBILITY_ANALYSIS.md, Lemma 3 + Theorem 2).
         if not assigned and cfg.get('evict_repair', True):
+            mode = cfg.get('evict_shelf', 'auto')
+            if mode == 'auto':
+                # a shelf laid along the longer bbox side is thinner, so it adds
+                # less area for the same set of blocks
+                bw = float((sol[:, 0] + sol[:, 2]).max() - sol[:, 0].min())
+                bh = float((sol[:, 1] + sol[:, 3]).max() - sol[:, 1].min())
+                mode = 'above' if bw >= bh else 'right'
             ev = evict_for_consistency(
                 n, H, V, sol, pre_mask, keyx, keyy, evict_score,
-                max_evict=int(cfg.get('evict_max', 64)))
+                max_evict=int(cfg.get('evict_max', 64)), shelf=mode)
             if ev is not None:
                 H2, V2, ordx, ordy, evicted = ev
                 H[:], V[:] = H2, V2
@@ -2429,11 +2524,24 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
                          iters=g_iters)
     r1 = legal_round(geo, cfg['polish_sweeps'])
     cost, sol, H, V, graph_info = finish(r1)
-    if max_penetration(r1[0]) <= _EPS_OVL:
-        c2, s2, h2, v2, g2 = finish(
-            legal_round(r1[0].copy(), cfg['polish_sweeps']))
-        if c2 < cost:
+    # each further round rebuilds the relation set from legal geometry, which
+    # gives cleaner axis choices; keep the best result, never a worse one
+    prev = r1
+    stop_when_flat = bool(cfg.get('legal_round_stop', True))
+    for _ in range(max(0, int(cfg.get('legal_rounds', 2)) - 1)):
+        if max_penetration(prev[0]) > _EPS_OVL:
+            break
+        rr = legal_round(prev[0].copy(), cfg['polish_sweeps'])
+        c2, s2, h2, v2, g2 = finish(rr)
+        gained = c2 < cost - 1e-12
+        if gained:
             cost, sol, H, V, graph_info = c2, s2, h2, v2, g2
+        prev = rr
+        # a rebuild that did not pay predicts the next one will not either, so
+        # further rounds are spent only on the cases still improving. Keeps the
+        # quality of a fixed 3-round schedule at close to 2-round wall-clock.
+        if stop_when_flat and not gained:
+            break
 
     # anchored boundary bits still violated -> retry with the extents driven
     # into the anchors' span (aggressive rung, pays only where needed)
@@ -2465,7 +2573,9 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
     if cost < 9 and cfg.get('ripple_repair', True):
         keyx = sol[:, 0] + 0.5 * sol[:, 2]
         keyy = sol[:, 1] + 0.5 * sol[:, 3]
-        proj_H, proj_V = build_graph(sol, keyx, keyy)
+        proj_H, proj_V = build_graph(sol, keyx, keyy,
+                                     cfg.get('graph_rule', 'gap'), pre_mask,
+                                     float(cfg.get('graph_square_k', 0.25)))
         sol, ripple_info = cluster_ripple_repair(
             sol, case, proj_H, proj_V, pre_mask, cfg, S, hpwl_base,
             area_base, n_soft)
@@ -2488,13 +2598,26 @@ def legalize_case(pred_xywh, case, cfg=None, verbose=False, g_iters=None):
     # Stage E-2: stage E parks evicted blocks in a shelf above the core, which
     # is feasible but expensive in bbox and HPWL. Pull them back into free
     # holes; exact-overlap + proxy gated, so it only ever improves.
-    reclaim_info = {'tried': 0, 'moved': 0, 'no_free': 0, 'runtime_s': 0.0}
+    reclaim_info = {'tried': 0, 'moved': 0, 'no_free': 0, 'runtime_s': 0.0,
+                    'round_gain': 0.0}
     if (cost < 9 and cfg.get('reclaim', True)
             and case_stats['evicted_total'] > 0):
         sol, reclaim_info = hole_relocate(
             sol, case, case_stats['evicted_set'], pre_mask, cfg, S,
             hpwl_base, area_base, n_soft, nbr_i, alpha)
         cost = proxy_cost(sol, case, hpwl_base, area_base, n_soft)
+        # A reclaimed block sits in a hole that no soft-constraint stage has
+        # seen: stage S snapped and DP-1 abutted the layout while that block was
+        # still parked in the shelf. Re-running one legal round rebuilds the
+        # relation set from the reclaimed geometry -- which also restores the
+        # slack invariant those stages rely on -- assigns minimal-movement (so
+        # the reclaimed positions survive), then re-polishes and re-snaps.
+        if reclaim_info['moved'] and cfg.get('reclaim_round', True):
+            rr = legal_round(sol.copy(), cfg['polish_sweeps'])
+            c_r, s_r, h_r, v_r, g_r = finish(rr)
+            reclaim_info['round_gain'] = float(cost - c_r)
+            if c_r < cost:
+                cost, sol, H, V, graph_info = c_r, s_r, h_r, v_r, g_r
 
     # Detailed placement must not perturb immutable fields. Re-stamp them before
     # the authoritative hard gate; any overlap exposed by this restoration makes
