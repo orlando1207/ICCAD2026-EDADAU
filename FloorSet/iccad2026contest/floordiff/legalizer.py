@@ -93,8 +93,26 @@ DEFAULT_CFG = {
     'reshape_repair': True,
     'reshape_group': True,
     'reshape_boundary': True,
+    # reshape_boundary only covers preplaced blocks (contract the wall onto
+    # them, since they can't move). A free block with the same boundary bit
+    # is normally closed by snap_soft's plain translate, but that translate
+    # can be blocked by a cluster-touch edge sitting on the near
+    # perpendicular face (case 25, block 31: a 0.11-unit gap to the right
+    # wall, translate would shear off the 0.11-wide touch keeping its
+    # cluster group connected). _try_boundary_extend grows the far edge
+    # instead of translating, so the near face -- and whatever it's
+    # touching -- never moves.
+    'reshape_boundary_free': True,
     'reshape_close_rel': 0.02,
-    'reshape_budget_s': 0.025,
+    # Measured: a single _try_group_reshape trial (the DAG reflow inside
+    # _assign_inside_walls) costs ~2ms at n=21 but ~25-33ms at n=100 -- the
+    # old 0.025s budget let exactly ONE trial run on a 100-block case before
+    # the deadline check cut the pass short, so a real fix sorted a few slots
+    # later than the first (failing) candidate never got tried at all (see
+    # case 79, block 66/44/76 grouping split). reshape_trials=16 already
+    # hard-caps trial count, so this only needs to comfortably cover 16
+    # trials at the observed worst per-trial cost (16*33ms=~0.53s).
+    'reshape_budget_s': 0.6,
     'reshape_trials': 16,
     'reshape_moves': 2,
     'reshape_max_growth': 0.10,
@@ -2011,6 +2029,43 @@ def _contract_high_wall(sol, axis, target_hi, pre_mask, shrinkable, cfg):
     return cand
 
 
+def _try_boundary_extend(sol, rec, cfg):
+    """Grow a free (non-preplaced) block toward its own required boundary
+    side, area-preserving, holding the far edge fixed -- the same
+    grow-and-shrink contract _try_group_reshape uses to close a cluster gap,
+    aimed at the bbox wall instead of another block. Two perpendicular-anchor
+    variants (shrink from the near vs. far perpendicular face) are generated
+    per gap by the caller; this only computes the geometry -- whichever
+    variant would sever an existing cluster touch on the near edge shows up
+    as a new grouping violation and shape_detail_repair's existing
+    violation/cost gate rejects it, same as it already does for
+    _try_group_reshape's perp_anchor choices. No DAG re-solve: a candidate
+    that grows into an occupied cell fails hard_feasibility inside
+    proxy_cost and is rejected by the cost gate, so this stays safe without
+    needing to actively clear an obstruction (case 79's blocked cluster gap
+    still needs the DAG-based _try_group_reshape path for that)."""
+    i, axis, high, gap, perp_anchor = rec
+    other = 1 - axis
+    old_perp_pos = float(sol[i, other])
+    old_perp_size = float(sol[i, 2 + other])
+    target = (old_perp_pos + old_perp_size * 2) if perp_anchor > 0 \
+        else (old_perp_pos - old_perp_size)
+    r = _reshape_extend(float(sol[i, axis]), float(sol[i, 2 + axis]),
+                        old_perp_pos, old_perp_size, gap if high else -gap,
+                        cfg['reshape_min_frac'],
+                        perp_center_target=target,
+                        aspect_cap=cfg['reshape_aspect_cap'])
+    if r is None:
+        return None
+    pos_sep1, size_sep1, pos_perp1, size_perp1 = r
+    cand = sol.copy()
+    cand[i, axis] = pos_sep1
+    cand[i, 2 + axis] = size_sep1
+    cand[i, other] = pos_perp1
+    cand[i, 2 + other] = size_perp1
+    return cand
+
+
 def _try_boundary_reshape(sol, rec, pre_mask, shrinkable, cfg):
     """Contract a high side directly, or mirror a low side into a high side."""
     _gap, _block, axis, high, target = rec
@@ -2085,6 +2140,29 @@ def shape_detail_repair(sol, case, pre_mask, shrinkable, cfg, S,
                         if 1e-8 < gap <= close_cap:
                             records.append((gap, 1,
                                             (gap, int(i), axis, False, target)))
+            # Same wall gaps, but for FREE blocks: pre_mask can't move at all,
+            # so the only fix is contracting the wall onto it (above). A free
+            # block with the same boundary bit is usually caught earlier by
+            # snap_soft's plain translate-to-touch pass -- this only matters
+            # when that translate is blocked (a cluster-touch edge sitting on
+            # the near perpendicular face, e.g.), which is exactly what a
+            # reshape (grow the far edge, shrink perpendicular) can clear
+            # without disturbing the touch. Kind 2 == _try_boundary_extend.
+            if cfg.get('reshape_boundary_free', True):
+                for i in np.nonzero((~pre_mask) & shrinkable
+                                    & (cons[:, 4] > 0))[0]:
+                    bits = int(cons[i, 4])
+                    for axis, low_bit, high_bit in ((0, 1, 2), (1, 8, 4)):
+                        if bits & high_bit:
+                            gap = hi[axis] - float(sol[i, axis] + sol[i, 2 + axis])
+                            if 1e-8 < gap <= close_cap:
+                                for pa in (1, -1):
+                                    records.append((gap, 2, (int(i), axis, True, gap, pa)))
+                        if bits & low_bit:
+                            gap = float(sol[i, axis]) - lo[axis]
+                            if 1e-8 < gap <= close_cap:
+                                for pa in (1, -1):
+                                    records.append((gap, 2, (int(i), axis, False, gap, pa)))
         records.sort(key=lambda z: (z[0], z[1]))
         accepted = False
         walls = _entry_walls(sol)
@@ -2092,9 +2170,12 @@ def shape_detail_repair(sol, case, pre_mask, shrinkable, cfg, S,
             if stats['trials'] >= trial_cap or time.perf_counter() >= deadline:
                 break
             stats['trials'] += 1
-            cand = _try_group_reshape(sol, rec, pre_mask, cfg, walls) \
-                if kind == 0 else _try_boundary_reshape(
-                    sol, rec, pre_mask, shrinkable, cfg)
+            if kind == 0:
+                cand = _try_group_reshape(sol, rec, pre_mask, cfg, walls)
+            elif kind == 1:
+                cand = _try_boundary_reshape(sol, rec, pre_mask, shrinkable, cfg)
+            else:
+                cand = _try_boundary_extend(sol, rec, cfg)
             if cand is None:
                 continue
             changed_shape = np.nonzero(np.max(
